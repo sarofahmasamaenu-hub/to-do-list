@@ -40,6 +40,7 @@ export interface StatusHistoryEntry {
   date: string;              // วันที่เปลี่ยนสถานะ (YYYY-MM-DD)
   note?: string;             // หมายเหตุเพิ่มเติม เช่น เลขพัสดุ EMS หรือผลการฟิตติ้ง
   updatedBy?: string;        // ชื่อพนักงานที่บันทึก
+  updatedAt?: string;        // ISO timestamp
 }
 
 export const PRODUCTION_PIPELINE_STEPS: OrderStatus[] = [
