@@ -1503,19 +1503,19 @@ export default function App() {
               className={`flex items-center space-x-3 ${isStaffMode ? 'cursor-default' : 'cursor-pointer'} group transition-all relative shrink-0`}
               title={isStaffMode ? "NUNUH Staff Workspace (พนักงานรับออเดอร์)" : "คลิกเพื่อกลับสู่หน้าแรกระบบห้องเสื้อ NUNUH"}
             >
-              <div className="relative group/logo">
-                <div className="h-11 w-11 rounded-2xl bg-natural-espresso group-hover:bg-natural-clay transition-colors flex items-center justify-center text-natural-cream shadow-sm overflow-hidden p-0.5 border border-natural-wheat/40">
-                  {boutiqueLogo ? (
-                    <img 
-                      src={boutiqueLogo} 
-                      alt="Company Logo" 
-                      className="h-full w-full object-contain rounded-xl bg-white" 
-                      referrerPolicy="no-referrer"
-                    />
-                  ) : (
-                    <Store className="h-5 w-5 text-natural-ochre" />
-                  )}
-                </div>
+              <div className="relative group/logo flex items-center justify-center">
+                {boutiqueLogo ? (
+                  <img 
+                    src={boutiqueLogo} 
+                    alt="Company Logo" 
+                    className="h-11 w-auto max-h-11 max-w-[140px] object-contain transition-transform group-hover:scale-105" 
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <div className="flex items-center justify-center text-natural-clay group-hover:text-natural-espresso transition-colors">
+                    <Store className="h-8 w-8" />
+                  </div>
+                )}
                 {!isCustomerMode && !isStaffMode && (
                   <button
                     type="button"

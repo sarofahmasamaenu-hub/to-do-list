@@ -219,7 +219,7 @@ export default function PrintOrderModal({ order, isOpen, onClose }: PrintOrderMo
                       <img 
                         src={boutiqueLogo} 
                         alt="Company Logo" 
-                        className="h-12 w-12 object-contain rounded-xl border border-natural-wheat bg-white p-0.5" 
+                        className="h-12 w-auto max-h-12 max-w-[140px] object-contain" 
                       />
                     )}
                     <div className="space-y-1.5">
@@ -451,7 +451,7 @@ export default function PrintOrderModal({ order, isOpen, onClose }: PrintOrderMo
                       <img 
                         src={boutiqueLogo} 
                         alt="Company Logo" 
-                        className="h-12 w-12 object-contain rounded-xl border border-natural-wheat bg-white p-0.5" 
+                        className="h-12 w-auto max-h-12 max-w-[140px] object-contain" 
                       />
                     )}
                     <div className="space-y-1.5">
