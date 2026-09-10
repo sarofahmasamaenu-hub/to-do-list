@@ -8,13 +8,21 @@ interface PrintOrderModalProps {
   order: Order | null;
   isOpen: boolean;
   onClose: () => void;
+  boutiqueLogo?: string;
+  boutiquePhone?: string;
 }
 
-export default function PrintOrderModal({ order, isOpen, onClose }: PrintOrderModalProps) {
+export default function PrintOrderModal({ 
+  order, 
+  isOpen, 
+  onClose,
+  boutiqueLogo: propBoutiqueLogo,
+  boutiquePhone: propBoutiquePhone
+}: PrintOrderModalProps) {
   if (!isOpen || !order) return null;
 
-  const boutiquePhone = localStorage.getItem('nunuh_boutique_phone') || '086-555-1234';
-  const boutiqueLogo = localStorage.getItem('nunuh_boutique_logo') || '';
+  const boutiquePhone = propBoutiquePhone || localStorage.getItem('nunuh_boutique_phone') || '086-555-1234';
+  const boutiqueLogo = propBoutiqueLogo !== undefined ? propBoutiqueLogo : (localStorage.getItem('nunuh_boutique_logo') || '');
   const [documentType, setDocumentType] = useState<'order' | 'receipt'>('order');
   const [receiptPaymentType, setReceiptPaymentType] = useState<'deposit' | 'full'>(
     order.deposit > 0 && Math.max(0, order.price - order.deposit - (order.discount || 0)) > 0 ? 'deposit' : 'full'

@@ -253,6 +253,29 @@ export async function fetchSettingsFromFirestore(): Promise<Record<string, any> 
 }
 
 /**
+ * Listen for real-time settings (Logo, Theme, Phone, etc.) across all connected devices
+ */
+export function subscribeToSettings(onUpdate: (settings: Record<string, any>) => void): () => void {
+  try {
+    const docRef = doc(db, 'settings', 'general');
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data) {
+          onUpdate(data);
+        }
+      }
+    }, (error) => {
+      console.warn('Firestore settings real-time subscription error:', error);
+    });
+    return unsubscribe;
+  } catch (e) {
+    console.warn('Could not attach Firestore settings onSnapshot:', e);
+    return () => {};
+  }
+}
+
+/**
  * Sync Catalogue to Firestore
  */
 export async function saveCatalogueToFirestore(items: CatalogueItem[]): Promise<void> {

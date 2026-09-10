@@ -21,6 +21,8 @@ import {
   fetchOrdersFromFirestore,
   subscribeToOrders,
   saveSettingsToFirestore,
+  fetchSettingsFromFirestore,
+  subscribeToSettings,
   saveCatalogueToFirestore,
   testFirestoreConnection,
   registerStaffOnline,
@@ -400,7 +402,15 @@ export default function App() {
 
   const handleUpdateBoutiquePhone = async (newPhone: string) => {
     setBoutiquePhone(newPhone);
-    localStorage.setItem('nunuh_boutique_phone', newPhone);
+    safeSetLocalStorage('nunuh_boutique_phone', newPhone);
+    saveSettingsToFirestore({ boutiquePhone: newPhone }).catch((err) => {
+      console.warn('Failed to save boutique phone to Firestore:', err);
+    });
+    try {
+      const channel = new BroadcastChannel('nunuh_multiuser_sync_channel');
+      channel.postMessage({ type: 'SETTINGS_UPDATE', settings: { boutiquePhone: newPhone } });
+      channel.close();
+    } catch (e) {}
     try {
       await fetch('/api/settings', {
         method: 'POST',
@@ -414,7 +424,15 @@ export default function App() {
 
   const handleUpdateBoutiqueLogo = async (newLogo: string) => {
     setBoutiqueLogo(newLogo);
-    localStorage.setItem('nunuh_boutique_logo', newLogo);
+    safeSetLocalStorage('nunuh_boutique_logo', newLogo);
+    saveSettingsToFirestore({ boutiqueLogo: newLogo }).catch((err) => {
+      console.warn('Failed to save boutique logo to Firestore:', err);
+    });
+    try {
+      const channel = new BroadcastChannel('nunuh_multiuser_sync_channel');
+      channel.postMessage({ type: 'SETTINGS_UPDATE', settings: { boutiqueLogo: newLogo } });
+      channel.close();
+    } catch (e) {}
     try {
       await fetch('/api/settings', {
         method: 'POST',
@@ -615,8 +633,45 @@ export default function App() {
       console.warn('Failed to sync catalogue:', e);
     }
 
-    // 3. Sync settings
+    // 3. Sync settings from Server and Firestore
     try {
+      // First check Firestore settings for the single source of truth across all devices
+      const firestoreSettings = await fetchSettingsFromFirestore();
+      if (firestoreSettings && typeof firestoreSettings === 'object' && Object.keys(firestoreSettings).length > 0) {
+        if (firestoreSettings.boutiquePhone) {
+          setBoutiquePhone(firestoreSettings.boutiquePhone);
+          safeSetLocalStorage('nunuh_boutique_phone', firestoreSettings.boutiquePhone);
+        }
+        if (firestoreSettings.boutiqueLogo !== undefined) {
+          setBoutiqueLogo(firestoreSettings.boutiqueLogo);
+          safeSetLocalStorage('nunuh_boutique_logo', firestoreSettings.boutiqueLogo);
+        }
+        if (firestoreSettings.theme) {
+          setTheme(firestoreSettings.theme);
+          safeSetLocalStorage('nunuh_selected_theme', firestoreSettings.theme);
+        }
+        if (firestoreSettings.lineChannelAccessToken) {
+          setLineChannelAccessToken(firestoreSettings.lineChannelAccessToken);
+          safeSetLocalStorage('nunuh_line_channel_access_token', firestoreSettings.lineChannelAccessToken);
+        }
+        if (firestoreSettings.lineChannelSecret) {
+          setLineChannelSecret(firestoreSettings.lineChannelSecret);
+          safeSetLocalStorage('nunuh_line_channel_secret', firestoreSettings.lineChannelSecret);
+        }
+        if (firestoreSettings.ownerLineUserId) {
+          setOwnerLineUserId(firestoreSettings.ownerLineUserId);
+          safeSetLocalStorage('nunuh_owner_line_user_id', firestoreSettings.ownerLineUserId);
+        }
+        if (firestoreSettings.lineOaId) {
+          setLineOaId(firestoreSettings.lineOaId);
+          safeSetLocalStorage('nunuh_line_oa_id', firestoreSettings.lineOaId);
+        }
+        if (firestoreSettings.lineOaChatUrl) {
+          setLineOaChatUrl(firestoreSettings.lineOaChatUrl);
+          safeSetLocalStorage('nunuh_line_oa_chat_url', firestoreSettings.lineOaChatUrl);
+        }
+      }
+
       const res = await fetch('/api/settings');
       if (res.ok) {
         const serverSettings = await res.json();
@@ -945,6 +1000,19 @@ export default function App() {
             });
           } else if (event.data.type === 'ORDERS_UPDATE' && Array.isArray(event.data.orders)) {
             setOrders(prev => mergeOrders(prev, event.data.orders));
+          } else if (event.data.type === 'SETTINGS_UPDATE' && event.data.settings) {
+            if (event.data.settings.boutiqueLogo !== undefined) {
+              setBoutiqueLogo(event.data.settings.boutiqueLogo);
+              safeSetLocalStorage('nunuh_boutique_logo', event.data.settings.boutiqueLogo);
+            }
+            if (event.data.settings.boutiquePhone) {
+              setBoutiquePhone(event.data.settings.boutiquePhone);
+              safeSetLocalStorage('nunuh_boutique_phone', event.data.settings.boutiquePhone);
+            }
+            if (event.data.settings.theme) {
+              setTheme(event.data.settings.theme);
+              safeSetLocalStorage('nunuh_selected_theme', event.data.settings.theme);
+            }
           }
         }
       };
@@ -979,6 +1047,15 @@ export default function App() {
             setCatalogue(parsed);
           }
         } catch (err) {}
+      }
+      if (e.key === 'nunuh_boutique_logo' && e.newValue !== null) {
+        setBoutiqueLogo(e.newValue);
+      }
+      if (e.key === 'nunuh_boutique_phone' && e.newValue) {
+        setBoutiquePhone(e.newValue);
+      }
+      if (e.key === 'nunuh_selected_theme' && e.newValue) {
+        setTheme(e.newValue);
       }
     };
 
@@ -1025,6 +1102,24 @@ export default function App() {
       }
     });
 
+    // ติดตั้ง Firebase Firestore Real-time Listener สำหรับการตั้งค่า (Logo, Theme, Phone) ซิงค์สดทุกเครื่องทันที
+    const unsubscribeSettings = subscribeToSettings((settings) => {
+      if (settings && typeof settings === 'object') {
+        if (settings.boutiqueLogo !== undefined) {
+          setBoutiqueLogo(settings.boutiqueLogo);
+          safeSetLocalStorage('nunuh_boutique_logo', settings.boutiqueLogo);
+        }
+        if (settings.boutiquePhone) {
+          setBoutiquePhone(settings.boutiquePhone);
+          safeSetLocalStorage('nunuh_boutique_phone', settings.boutiquePhone);
+        }
+        if (settings.theme) {
+          setTheme(settings.theme);
+          safeSetLocalStorage('nunuh_selected_theme', settings.theme);
+        }
+      }
+    });
+
     // ติดตั้ง Firebase Firestore Real-time Listener สำหรับสถานะพนักงานออนไลน์
     const unsubscribeStaff = subscribeToOnlineStaff((onlineStaffList) => {
       if (onlineStaffList && Array.isArray(onlineStaffList)) {
@@ -1047,6 +1142,7 @@ export default function App() {
       clearInterval(pollInterval);
       clearInterval(serverPollInterval);
       unsubscribeFirestore();
+      unsubscribeSettings();
       unsubscribeStaff();
     };
   }, []);
@@ -2192,18 +2288,34 @@ export default function App() {
                       lineOaChatUrl,
                       theme
                     };
+                    
+                    // 1. Sync settings to Firebase Firestore
+                    saveSettingsToFirestore(payload).catch((err) => {
+                      console.warn('Failed to save settings to Firestore:', err);
+                    });
+
+                    // 2. Broadcast to other open tabs
+                    try {
+                      const channel = new BroadcastChannel('nunuh_multiuser_sync_channel');
+                      channel.postMessage({ type: 'SETTINGS_UPDATE', settings: payload });
+                      channel.close();
+                    } catch (e) {}
+
+                    // 3. Sync to Express Backend Server
                     await fetch('/api/settings', {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify(payload)
                     });
-                    localStorage.setItem('nunuh_boutique_phone', boutiquePhone);
-                    localStorage.setItem('nunuh_boutique_logo', boutiqueLogo);
-                    localStorage.setItem('nunuh_owner_line_user_id', ownerLineUserId);
-                    localStorage.setItem('nunuh_line_channel_access_token', lineChannelAccessToken);
-                    localStorage.setItem('nunuh_line_channel_secret', lineChannelSecret);
-                    localStorage.setItem('nunuh_line_oa_id', lineOaId);
-                    localStorage.setItem('nunuh_line_oa_chat_url', lineOaChatUrl);
+
+                    safeSetLocalStorage('nunuh_boutique_phone', boutiquePhone);
+                    safeSetLocalStorage('nunuh_boutique_logo', boutiqueLogo);
+                    safeSetLocalStorage('nunuh_owner_line_user_id', ownerLineUserId);
+                    safeSetLocalStorage('nunuh_line_channel_access_token', lineChannelAccessToken);
+                    safeSetLocalStorage('nunuh_line_channel_secret', lineChannelSecret);
+                    safeSetLocalStorage('nunuh_line_oa_id', lineOaId);
+                    safeSetLocalStorage('nunuh_line_oa_chat_url', lineOaChatUrl);
+                    safeSetLocalStorage('nunuh_selected_theme', theme);
                     
                     fetchLineConfigStatus();
                     setIsSettingsOpen(false);
@@ -2370,12 +2482,12 @@ export default function App() {
                         </label>
 
                         <div className="flex items-center gap-3 bg-natural-sand/20 p-3 rounded-2xl border border-natural-wheat/60">
-                          <div className="h-14 w-14 rounded-2xl bg-white border border-natural-wheat/80 flex items-center justify-center p-1 shadow-2xs overflow-hidden shrink-0">
+                          <div className="h-14 w-14 flex items-center justify-center shrink-0">
                             {boutiqueLogo ? (
                               <img
                                 src={boutiqueLogo}
                                 alt="Company Logo Preview"
-                                className="h-full w-full object-contain"
+                                className="max-h-14 max-w-14 object-contain"
                                 referrerPolicy="no-referrer"
                               />
                             ) : (
