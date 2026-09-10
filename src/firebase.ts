@@ -94,15 +94,75 @@ export async function saveOrdersBatchToFirestore(orders: Order[]): Promise<void>
 }
 
 /**
- * Delete an order from Firestore
+ * Delete an order from Firestore and record in deleted_orders registry
  */
 export async function deleteOrderFromFirestore(orderId: string): Promise<void> {
   if (!orderId) return;
   try {
     const orderDocRef = doc(db, 'orders', orderId);
     await deleteDoc(orderDocRef);
+
+    // Save to deleted_orders doc so all devices across the world sync the deletion in real-time
+    const deletedDocRef = doc(db, 'settings', 'deleted_orders');
+    try {
+      const docSnap = await getDoc(deletedDocRef);
+      const existingDeleted: string[] = docSnap.exists() && Array.isArray(docSnap.data()?.deletedIds)
+        ? docSnap.data().deletedIds
+        : [];
+      if (!existingDeleted.includes(orderId)) {
+        const updatedList = [...existingDeleted, orderId];
+        await setDoc(deletedDocRef, {
+          deletedIds: updatedList,
+          lastDeletedId: orderId,
+          _syncedAt: new Date().toISOString()
+        }, { merge: true });
+      }
+    } catch (err) {
+      console.warn('Error recording deleted order in Firestore registry:', err);
+    }
   } catch (e) {
     console.warn('Error deleting order from Firestore:', e);
+  }
+}
+
+/**
+ * Fetch list of deleted order IDs from Firestore
+ */
+export async function fetchDeletedOrderIdsFromFirestore(): Promise<string[]> {
+  try {
+    const docRef = doc(db, 'settings', 'deleted_orders');
+    const docSnap = await getDoc(docRef);
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      if (data && Array.isArray(data.deletedIds)) {
+        return data.deletedIds;
+      }
+    }
+  } catch (e) {
+    console.warn('Error fetching deleted orders from Firestore:', e);
+  }
+  return [];
+}
+
+/**
+ * Listen for real-time deleted order events across all devices
+ */
+export function subscribeToDeletedOrders(onDeleted: (deletedIds: string[]) => void): () => void {
+  try {
+    const unsubscribe = onSnapshot(doc(db, 'settings', 'deleted_orders'), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (data && Array.isArray(data.deletedIds)) {
+          onDeleted(data.deletedIds);
+        }
+      }
+    }, (error) => {
+      console.warn('Firestore deleted orders subscription error:', error);
+    });
+    return unsubscribe;
+  } catch (e) {
+    console.warn('Could not attach Firestore deleted orders listener:', e);
+    return () => {};
   }
 }
 
@@ -199,16 +259,24 @@ export async function fetchOrdersFromFirestore(): Promise<Order[]> {
 /**
  * Listen for real-time order updates across all connected devices
  */
-export function subscribeToOrders(onUpdate: (orders: Order[]) => void): () => void {
+export function subscribeToOrders(onUpdate: (orders: Order[], removedIds: string[]) => void): () => void {
   try {
     const unsubscribe = onSnapshot(collection(db, 'orders'), (snapshot) => {
       const updatedOrders: Order[] = [];
+      const removedIds: string[] = [];
+
+      // Detect document deletions in real-time
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'removed') {
+          removedIds.push(change.doc.id);
+        }
+      });
+
       snapshot.forEach((doc) => {
         updatedOrders.push(mapDocToOrder(doc));
       });
-      if (updatedOrders.length > 0) {
-        onUpdate(updatedOrders);
-      }
+
+      onUpdate(updatedOrders, removedIds);
     }, (error) => {
       console.warn('Firestore real-time subscription error:', error);
     });

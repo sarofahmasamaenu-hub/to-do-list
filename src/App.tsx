@@ -18,6 +18,8 @@ import {
   saveOrderToFirestore,
   saveOrdersBatchToFirestore,
   deleteOrderFromFirestore,
+  fetchDeletedOrderIdsFromFirestore,
+  subscribeToDeletedOrders,
   fetchOrdersFromFirestore,
   subscribeToOrders,
   saveSettingsToFirestore,
@@ -559,6 +561,33 @@ export default function App() {
   // ซิงค์ข้อมูลกับ Server Backend
   const syncWithServer = async (ordersToUpload?: Order[]) => {
     try {
+      // 0. ซิงค์รายการออเดอร์ที่ถูกลบจากทั้ง Server และ Firestore เพื่อป้องกันการฟื้นคืนชีพ
+      let serverDeleted: string[] = [];
+      try {
+        const delRes = await fetch('/api/deleted-orders');
+        if (delRes.ok) {
+          const delData = await delRes.json();
+          if (Array.isArray(delData.deletedIds)) {
+            serverDeleted = delData.deletedIds;
+          }
+        }
+      } catch (e) {}
+
+      let firestoreDeleted: string[] = [];
+      try {
+        firestoreDeleted = await fetchDeletedOrderIdsFromFirestore();
+      } catch (e) {}
+
+      const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
+      let localDeleted: string[] = [];
+      try { localDeleted = JSON.parse(deletedIdsStr); } catch (e) {}
+
+      const allDeleted = Array.from(new Set([...localDeleted, ...serverDeleted, ...firestoreDeleted]));
+      if (allDeleted.length > localDeleted.length) {
+        localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(allDeleted));
+      }
+      const deletedSet = new Set(allDeleted);
+
       const storedLocal = localStorage.getItem('nunuh_orders');
       let currentLocal: Order[] = [];
       if (storedLocal) {
@@ -566,29 +595,33 @@ export default function App() {
           currentLocal = JSON.parse(storedLocal);
         } catch (e) {}
       }
+      // ลบรายการที่ถูกลบออกจาก local ทันที
+      currentLocal = currentLocal.filter(o => o && o.id && !deletedSet.has(o.id));
 
-      // First fetch latest from server / database
+      // 1. Fetch latest from server / database
       let fetchedFromServer: Order[] = [];
       try {
         const getRes = await fetch('/api/orders');
         if (getRes.ok) {
           const data = await getRes.json();
           if (Array.isArray(data)) {
-            fetchedFromServer = data;
+            fetchedFromServer = data.filter(o => o && o.id && !deletedSet.has(o.id));
           }
         }
       } catch (e) {}
 
       let combined = mergeOrders(currentLocal, fetchedFromServer);
       if (ordersToUpload && ordersToUpload.length > 0) {
-        combined = mergeOrders(combined, ordersToUpload);
+        const cleanUpload = ordersToUpload.filter(o => o && o.id && !deletedSet.has(o.id));
+        combined = mergeOrders(combined, cleanUpload);
       }
 
-      // Try fetching from Firebase Firestore as well
+      // 2. Try fetching from Firebase Firestore as well
       try {
         const firestoreOrders = await fetchOrdersFromFirestore();
         if (firestoreOrders && firestoreOrders.length > 0) {
-          combined = mergeOrders(combined, firestoreOrders);
+          const cleanFirestore = firestoreOrders.filter(o => o && o.id && !deletedSet.has(o.id));
+          combined = mergeOrders(combined, cleanFirestore);
         }
       } catch (e) {}
 
@@ -598,7 +631,7 @@ export default function App() {
       const publicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
 
       if (combined.length > 0) {
-        // Also ensure orders are saved to Firestore in background
+        // Also ensure clean orders are saved to Firestore in background
         saveOrdersBatchToFirestore(combined).catch(() => {});
 
         const response = await fetch('/api/orders', {
@@ -610,7 +643,8 @@ export default function App() {
         if (response.ok) {
           const mergedFromServer = await response.json();
           if (Array.isArray(mergedFromServer) && mergedFromServer.length > 0) {
-            const finalMerged = mergeOrders(combined, mergedFromServer);
+            const cleanFinal = mergedFromServer.filter(o => o && o.id && !deletedSet.has(o.id));
+            const finalMerged = mergeOrders(combined, cleanFinal);
             setOrders(finalMerged);
             safeSetLocalStorage('nunuh_orders', finalMerged);
           }
@@ -956,7 +990,7 @@ export default function App() {
         eventSource.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload.type === 'orders_updated') {
+            if (payload.type === 'orders_updated' || payload.type === 'order_deleted') {
               let incomingActive: Order[] = [];
               let serverDeletedIds: string[] = [];
 
@@ -980,12 +1014,21 @@ export default function App() {
 
               const combinedDeleted = Array.from(new Set([...localDeleted, ...serverDeletedIds]));
               localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(combinedDeleted));
-
               const deletedSet = new Set(combinedDeleted);
-              const cleanActive = incomingActive.filter((o: Order) => !deletedSet.has(o.id));
 
-              setOrders(cleanActive);
-              localStorage.setItem('nunuh_orders', JSON.stringify(cleanActive));
+              if (serverDeletedIds.length > 0) {
+                setOrders(prev => {
+                  const filtered = prev.filter((o: Order) => !deletedSet.has(o.id));
+                  safeSetLocalStorage('nunuh_orders', filtered);
+                  return filtered;
+                });
+              }
+
+              if (incomingActive.length > 0 || (payload.data && Array.isArray(payload.data.orders))) {
+                const cleanActive = incomingActive.filter((o: Order) => !deletedSet.has(o.id));
+                setOrders(cleanActive);
+                safeSetLocalStorage('nunuh_orders', cleanActive);
+              }
             } else if (payload.type === 'catalogue_updated' && Array.isArray(payload.data)) {
               setCatalogue(payload.data);
               localStorage.setItem('nunuh_catalogue', JSON.stringify(payload.data));
@@ -1129,21 +1172,62 @@ export default function App() {
       syncAllDataWithServer();
     }, 2500);
 
-    // ติดตั้ง Firebase Firestore Real-time Listener เพื่อซิงค์ข้ามทุกอุปกรณ์และหลายผู้ใช้ทันที
-    const unsubscribeFirestore = subscribeToOrders((firestoreOrders) => {
-      if (firestoreOrders && Array.isArray(firestoreOrders) && firestoreOrders.length > 0) {
+    // ติดตั้ง Firebase Firestore Real-time Listener สำหรับการลบออเดอร์ (ข้ามทุกอุปกรณ์แบบเรียลไทม์)
+    const unsubscribeDeleted = subscribeToDeletedOrders((remoteDeletedIds) => {
+      if (Array.isArray(remoteDeletedIds) && remoteDeletedIds.length > 0) {
         const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
-        let deletedIds: string[] = [];
-        try { deletedIds = JSON.parse(deletedIdsStr); } catch (e) {}
-        const deletedSet = new Set(deletedIds);
-        const cleanFirestore = firestoreOrders.filter(o => !deletedSet.has(o.id));
+        let localDeleted: string[] = [];
+        try { localDeleted = JSON.parse(deletedIdsStr); } catch (e) {}
+
+        const combined = Array.from(new Set([...localDeleted, ...remoteDeletedIds]));
+        localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(combined));
+        const deletedSet = new Set(combined);
 
         setOrders(prev => {
-          const merged = mergeOrders(prev, cleanFirestore);
-          safeSetLocalStorage('nunuh_orders', merged);
-          return merged;
+          const filtered = prev.filter(o => o && o.id && !deletedSet.has(o.id));
+          safeSetLocalStorage('nunuh_orders', filtered);
+          return filtered;
         });
       }
+    });
+
+    // ติดตั้ง Firebase Firestore Real-time Listener เพื่อซิงค์ข้ามทุกอุปกรณ์และหลายผู้ใช้ทันที
+    const unsubscribeFirestore = subscribeToOrders((firestoreOrders, removedIds) => {
+      const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
+      let deletedIds: string[] = [];
+      try { deletedIds = JSON.parse(deletedIdsStr); } catch (e) {}
+
+      let changedDeleted = false;
+      if (Array.isArray(removedIds) && removedIds.length > 0) {
+        for (const rid of removedIds) {
+          if (!deletedIds.includes(rid)) {
+            deletedIds.push(rid);
+            changedDeleted = true;
+          }
+        }
+      }
+      if (changedDeleted) {
+        localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(deletedIds));
+      }
+      const deletedSet = new Set(deletedIds);
+
+      const cleanFirestore = (firestoreOrders || []).filter(o => o && o.id && !deletedSet.has(o.id));
+
+      setOrders(prev => {
+        const firestoreIdSet = new Set(cleanFirestore.map(o => o.id));
+        const now = Date.now();
+        // อย่าคืนชีพออเดอร์ที่ถูกลบไปแล้วจากเครื่องอื่น เว้นแต่เป็นออเดอร์ที่เพิ่งสร้างในเครื่องนี้ภายใน 15 วินาที
+        const locallyRetained = prev.filter(o => {
+          if (!o || !o.id) return false;
+          if (deletedSet.has(o.id)) return false;
+          if (firestoreIdSet.has(o.id)) return false;
+          return (o.updatedAt && (now - o.updatedAt < 15000));
+        });
+
+        const merged = mergeOrders(cleanFirestore, locallyRetained);
+        safeSetLocalStorage('nunuh_orders', merged);
+        return merged;
+      });
     });
 
     // ติดตั้ง Firebase Firestore Real-time Listener สำหรับการตั้งค่า (Logo, Theme, Phone) ซิงค์สดทุกเครื่องทันที
@@ -1185,6 +1269,7 @@ export default function App() {
       if (sseRetryTimer) clearTimeout(sseRetryTimer);
       clearInterval(pollInterval);
       clearInterval(serverPollInterval);
+      unsubscribeDeleted();
       unsubscribeFirestore();
       unsubscribeSettings();
       unsubscribeStaff();
@@ -1393,7 +1478,7 @@ export default function App() {
       console.warn("Server delete failed, will sync later:", err);
     }
 
-    saveOrdersToStorage(updated, orderId);
+    safeSetLocalStorage('nunuh_orders', updated);
   };
 
   // แก้ไขรายละเอียดออเดอร์ทั้งหมด

@@ -499,6 +499,11 @@ app.get("/api/orders", async (req, res) => {
   res.json(cleanOrders);
 });
 
+app.get("/api/deleted-orders", async (req, res) => {
+  const deletedIds = await readDeletedOrdersOnServer();
+  res.json({ deletedIds });
+});
+
 app.delete("/api/orders/:id", async (req, res) => {
   const { id } = req.params;
   
@@ -514,7 +519,8 @@ app.delete("/api/orders/:id", async (req, res) => {
   const updated = current.filter((o: any) => o.id !== id);
   await writeOrdersOnServer(updated);
   
-  // Real-time broadcast to all clients
+  // Real-time broadcast to all clients with explicit order_deleted and orders_updated
+  broadcastSSEEvent("order_deleted", { orders: updated, deletedId: id, deletedIds });
   broadcastSSEEvent("orders_updated", { orders: updated, deletedId: id, deletedIds });
 
   res.json({ success: true, orders: updated, deletedId: id, deletedIds });
@@ -563,8 +569,8 @@ app.post("/api/orders", async (req: any, res) => {
     
     await writeOrdersOnServer(fullyMerged);
 
-    // Real-time broadcast to all connected users (Staff & Main Admin)
-    broadcastSSEEvent("orders_updated", fullyMerged);
+    // Real-time broadcast to all connected users (Staff & Main Admin) with deletedIds to prevent resurrection
+    broadcastSSEEvent("orders_updated", { orders: fullyMerged, deletedIds });
 
     res.json(fullyMerged);
   } else if (Array.isArray(req.body)) {
@@ -595,7 +601,7 @@ app.post("/api/orders", async (req: any, res) => {
     await writeOrdersOnServer(fullyMerged);
 
     // Real-time broadcast
-    broadcastSSEEvent("orders_updated", fullyMerged);
+    broadcastSSEEvent("orders_updated", { orders: fullyMerged, deletedIds });
 
     res.json(fullyMerged);
   } else {
