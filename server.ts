@@ -629,7 +629,18 @@ app.post("/api/settings", async (req, res) => {
   const incoming = req.body;
   if (incoming && typeof incoming === 'object') {
     const current = await readSettingsOnServer();
-    const updated = { ...current, ...incoming };
+    const filteredIncoming = { ...incoming };
+    
+    // Prevent empty string logo or phone from overwriting valid existing values unless explicit delete flag is set
+    if (filteredIncoming.boutiqueLogo === "" && current.boutiqueLogo && !filteredIncoming._explicitDelete) {
+      delete filteredIncoming.boutiqueLogo;
+    }
+    if (filteredIncoming.boutiquePhone === "" && current.boutiquePhone && !filteredIncoming._explicitDelete) {
+      delete filteredIncoming.boutiquePhone;
+    }
+    
+    delete filteredIncoming._explicitDelete;
+    const updated = { ...current, ...filteredIncoming };
     await writeSettingsOnServer(updated);
     broadcastSSEEvent("settings_updated", updated);
     res.json({ success: true, settings: updated });

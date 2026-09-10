@@ -4,6 +4,7 @@ import {
   collection,
   doc,
   setDoc,
+  getDoc,
   getDocs,
   deleteDoc,
   onSnapshot,
@@ -238,11 +239,16 @@ export async function saveSettingsToFirestore(settings: Record<string, any>): Pr
  */
 export async function fetchSettingsFromFirestore(): Promise<Record<string, any> | null> {
   try {
+    const docRef = doc(db, 'settings', 'general');
+    const docSnap = await getDoc(docRef);
+    if (docSnap.exists()) {
+      return docSnap.data();
+    }
     const snapshot = await getDocs(collection(db, 'settings'));
     let result: Record<string, any> | null = null;
-    snapshot.forEach((doc) => {
-      if (doc.id === 'general') {
-        result = doc.data();
+    snapshot.forEach((d) => {
+      if (d.id === 'general') {
+        result = d.data();
       }
     });
     return result;

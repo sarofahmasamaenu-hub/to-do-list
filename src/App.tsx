@@ -425,19 +425,35 @@ export default function App() {
   const handleUpdateBoutiqueLogo = async (newLogo: string) => {
     setBoutiqueLogo(newLogo);
     safeSetLocalStorage('nunuh_boutique_logo', newLogo);
-    saveSettingsToFirestore({ boutiqueLogo: newLogo }).catch((err) => {
+    
+    // 1. Sync to Firebase Firestore immediately
+    saveSettingsToFirestore({ 
+      boutiqueLogo: newLogo,
+      boutiquePhone,
+      theme,
+      publicUrl: localStorage.getItem('nunuh_public_url') || window.location.origin
+    }).catch((err) => {
       console.warn('Failed to save boutique logo to Firestore:', err);
     });
+
+    // 2. Broadcast immediately to all open tabs in this browser
     try {
       const channel = new BroadcastChannel('nunuh_multiuser_sync_channel');
-      channel.postMessage({ type: 'SETTINGS_UPDATE', settings: { boutiqueLogo: newLogo } });
+      channel.postMessage({ type: 'SETTINGS_UPDATE', settings: { boutiqueLogo: newLogo, boutiquePhone, theme } });
       channel.close();
     } catch (e) {}
+
+    // 3. Sync to Express Backend Server
     try {
       await fetch('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ boutiqueLogo: newLogo })
+        body: JSON.stringify({ 
+          boutiqueLogo: newLogo,
+          boutiquePhone,
+          theme,
+          _explicitDelete: newLogo === ''
+        })
       });
     } catch (e) {
       console.warn('Failed to sync boutique logo with server:', e);
@@ -633,112 +649,140 @@ export default function App() {
       console.warn('Failed to sync catalogue:', e);
     }
 
-    // 3. Sync settings from Server and Firestore
+    // 3. Sync settings from Server and Firestore (Bidirectional Smart Synchronization)
     try {
-      // First check Firestore settings for the single source of truth across all devices
+      let mergedLogo = localStorage.getItem('nunuh_boutique_logo') || boutiqueLogo || '';
+      let mergedPhone = localStorage.getItem('nunuh_boutique_phone') || boutiquePhone || '086-555-1234';
+      let mergedTheme = localStorage.getItem('nunuh_selected_theme') || theme || 'pink';
+      let mergedToken = localStorage.getItem('nunuh_line_channel_access_token') || lineChannelAccessToken || '';
+      let mergedSecret = localStorage.getItem('nunuh_line_channel_secret') || lineChannelSecret || '';
+      let mergedOwnerId = localStorage.getItem('nunuh_owner_line_user_id') || ownerLineUserId || '';
+      let mergedLineOaId = localStorage.getItem('nunuh_line_oa_id') || lineOaId || '@237aynfq';
+      let mergedLineOaChatUrl = localStorage.getItem('nunuh_line_oa_chat_url') || lineOaChatUrl || 'https://chat.line.biz/U7ad64905450d2c18cf2eb27f61c5ea4c';
+      let mergedPublicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
+
+      // 3.1 Fetch Firestore settings (Cloud source of truth)
       const firestoreSettings = await fetchSettingsFromFirestore();
-      if (firestoreSettings && typeof firestoreSettings === 'object' && Object.keys(firestoreSettings).length > 0) {
-        if (firestoreSettings.boutiquePhone) {
-          setBoutiquePhone(firestoreSettings.boutiquePhone);
-          safeSetLocalStorage('nunuh_boutique_phone', firestoreSettings.boutiquePhone);
+      if (firestoreSettings && typeof firestoreSettings === 'object') {
+        if (firestoreSettings.boutiqueLogo) {
+          mergedLogo = firestoreSettings.boutiqueLogo;
         }
-        if (firestoreSettings.boutiqueLogo !== undefined) {
-          setBoutiqueLogo(firestoreSettings.boutiqueLogo);
-          safeSetLocalStorage('nunuh_boutique_logo', firestoreSettings.boutiqueLogo);
+        if (firestoreSettings.boutiquePhone) {
+          mergedPhone = firestoreSettings.boutiquePhone;
         }
         if (firestoreSettings.theme) {
-          setTheme(firestoreSettings.theme);
-          safeSetLocalStorage('nunuh_selected_theme', firestoreSettings.theme);
+          mergedTheme = firestoreSettings.theme;
         }
         if (firestoreSettings.lineChannelAccessToken) {
-          setLineChannelAccessToken(firestoreSettings.lineChannelAccessToken);
-          safeSetLocalStorage('nunuh_line_channel_access_token', firestoreSettings.lineChannelAccessToken);
+          mergedToken = firestoreSettings.lineChannelAccessToken;
         }
         if (firestoreSettings.lineChannelSecret) {
-          setLineChannelSecret(firestoreSettings.lineChannelSecret);
-          safeSetLocalStorage('nunuh_line_channel_secret', firestoreSettings.lineChannelSecret);
+          mergedSecret = firestoreSettings.lineChannelSecret;
         }
         if (firestoreSettings.ownerLineUserId) {
-          setOwnerLineUserId(firestoreSettings.ownerLineUserId);
-          safeSetLocalStorage('nunuh_owner_line_user_id', firestoreSettings.ownerLineUserId);
+          mergedOwnerId = firestoreSettings.ownerLineUserId;
         }
         if (firestoreSettings.lineOaId) {
-          setLineOaId(firestoreSettings.lineOaId);
-          safeSetLocalStorage('nunuh_line_oa_id', firestoreSettings.lineOaId);
+          mergedLineOaId = firestoreSettings.lineOaId;
         }
         if (firestoreSettings.lineOaChatUrl) {
-          setLineOaChatUrl(firestoreSettings.lineOaChatUrl);
-          safeSetLocalStorage('nunuh_line_oa_chat_url', firestoreSettings.lineOaChatUrl);
+          mergedLineOaChatUrl = firestoreSettings.lineOaChatUrl;
         }
       }
 
+      // 3.2 Fetch Server API settings
       const res = await fetch('/api/settings');
       if (res.ok) {
         const serverSettings = await res.json();
-        if (serverSettings && typeof serverSettings === 'object' && Object.keys(serverSettings).length > 0) {
-          if (serverSettings.boutiquePhone) {
-            setBoutiquePhone(serverSettings.boutiquePhone);
-            safeSetLocalStorage('nunuh_boutique_phone', serverSettings.boutiquePhone);
+        if (serverSettings && typeof serverSettings === 'object') {
+          if (serverSettings.boutiqueLogo) {
+            mergedLogo = serverSettings.boutiqueLogo;
           }
-          if (serverSettings.boutiqueLogo !== undefined) {
-            setBoutiqueLogo(serverSettings.boutiqueLogo);
-            safeSetLocalStorage('nunuh_boutique_logo', serverSettings.boutiqueLogo);
+          if (serverSettings.boutiquePhone) {
+            mergedPhone = serverSettings.boutiquePhone;
           }
           if (serverSettings.theme) {
-            setTheme(serverSettings.theme);
-            safeSetLocalStorage('nunuh_selected_theme', serverSettings.theme);
+            mergedTheme = serverSettings.theme;
           }
           if (serverSettings.lineChannelAccessToken) {
-            setLineChannelAccessToken(serverSettings.lineChannelAccessToken);
-            safeSetLocalStorage('nunuh_line_channel_access_token', serverSettings.lineChannelAccessToken);
+            mergedToken = serverSettings.lineChannelAccessToken;
           }
           if (serverSettings.lineChannelSecret) {
-            setLineChannelSecret(serverSettings.lineChannelSecret);
-            safeSetLocalStorage('nunuh_line_channel_secret', serverSettings.lineChannelSecret);
+            mergedSecret = serverSettings.lineChannelSecret;
           }
           if (serverSettings.ownerLineUserId) {
-            setOwnerLineUserId(serverSettings.ownerLineUserId);
-            safeSetLocalStorage('nunuh_owner_line_user_id', serverSettings.ownerLineUserId);
+            mergedOwnerId = serverSettings.ownerLineUserId;
           }
           if (serverSettings.lineOaId) {
-            setLineOaId(serverSettings.lineOaId);
-            safeSetLocalStorage('nunuh_line_oa_id', serverSettings.lineOaId);
+            mergedLineOaId = serverSettings.lineOaId;
           }
           if (serverSettings.lineOaChatUrl) {
-            setLineOaChatUrl(serverSettings.lineOaChatUrl);
-            safeSetLocalStorage('nunuh_line_oa_chat_url', serverSettings.lineOaChatUrl);
+            mergedLineOaChatUrl = serverSettings.lineOaChatUrl;
           }
           if (serverSettings.publicUrl) {
-            safeSetLocalStorage('nunuh_public_url', serverSettings.publicUrl);
+            mergedPublicUrl = serverSettings.publicUrl;
           }
-        } else {
-          // If server is empty, upload local settings
-          const localPhone = localStorage.getItem('nunuh_boutique_phone') || '086-555-1234';
-          const localLogo = localStorage.getItem('nunuh_boutique_logo') || '';
-          const localTheme = localStorage.getItem('nunuh_selected_theme') || 'pink';
-          const localToken = localStorage.getItem('nunuh_line_channel_access_token') || '';
-          const localSecret = localStorage.getItem('nunuh_line_channel_secret') || '';
-          const localOwnerId = localStorage.getItem('nunuh_owner_line_user_id') || '';
-          const localLineOaId = localStorage.getItem('nunuh_line_oa_id') || '@237aynfq';
-          const localLineOaChatUrl = localStorage.getItem('nunuh_line_oa_chat_url') || 'https://chat.line.biz/U7ad64905450d2c18cf2eb27f61c5ea4c';
-          const localPublicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
-
-          await fetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              boutiquePhone: localPhone,
-              boutiqueLogo: localLogo,
-              theme: localTheme,
-              lineChannelAccessToken: localToken,
-              lineChannelSecret: localSecret,
-              ownerLineUserId: localOwnerId,
-              lineOaId: localLineOaId,
-              lineOaChatUrl: localLineOaChatUrl,
-              publicUrl: localPublicUrl
-            })
-          });
         }
+      }
+
+      // 3.3 Apply merged settings to active state & local storage
+      if (mergedLogo) {
+        setBoutiqueLogo(mergedLogo);
+        safeSetLocalStorage('nunuh_boutique_logo', mergedLogo);
+      }
+      if (mergedPhone) {
+        setBoutiquePhone(mergedPhone);
+        safeSetLocalStorage('nunuh_boutique_phone', mergedPhone);
+      }
+      if (mergedTheme) {
+        setTheme(mergedTheme);
+        safeSetLocalStorage('nunuh_selected_theme', mergedTheme);
+      }
+      if (mergedToken) {
+        setLineChannelAccessToken(mergedToken);
+        safeSetLocalStorage('nunuh_line_channel_access_token', mergedToken);
+      }
+      if (mergedSecret) {
+        setLineChannelSecret(mergedSecret);
+        safeSetLocalStorage('nunuh_line_channel_secret', mergedSecret);
+      }
+      if (mergedOwnerId) {
+        setOwnerLineUserId(mergedOwnerId);
+        safeSetLocalStorage('nunuh_owner_line_user_id', mergedOwnerId);
+      }
+      if (mergedLineOaId) {
+        setLineOaId(mergedLineOaId);
+        safeSetLocalStorage('nunuh_line_oa_id', mergedLineOaId);
+      }
+      if (mergedLineOaChatUrl) {
+        setLineOaChatUrl(mergedLineOaChatUrl);
+        safeSetLocalStorage('nunuh_line_oa_chat_url', mergedLineOaChatUrl);
+      }
+      if (mergedPublicUrl) {
+        safeSetLocalStorage('nunuh_public_url', mergedPublicUrl);
+      }
+
+      // 3.4 Reconcile with Server and Firestore so all storage layers stay 100% in sync
+      const fullSettingsPayload = {
+        boutiquePhone: mergedPhone,
+        boutiqueLogo: mergedLogo,
+        theme: mergedTheme,
+        lineChannelAccessToken: mergedToken,
+        lineChannelSecret: mergedSecret,
+        ownerLineUserId: mergedOwnerId,
+        lineOaId: mergedLineOaId,
+        lineOaChatUrl: mergedLineOaChatUrl,
+        publicUrl: mergedPublicUrl
+      };
+
+      if (mergedLogo || mergedPhone) {
+        fetch('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(fullSettingsPayload)
+        }).catch(() => {});
+
+        saveSettingsToFirestore(fullSettingsPayload).catch(() => {});
       }
     } catch (e) {
       console.warn('Failed to sync settings:', e);
@@ -2093,6 +2137,8 @@ export default function App() {
                   <OrderTracker 
                     orders={filteredOrdersForStaff} 
                     catalogue={catalogue}
+                    boutiqueLogo={boutiqueLogo}
+                    boutiquePhone={boutiquePhone}
                     onUpdateOrderStatus={handleUpdateOrderStatus}
                     onDeleteOrder={handleDeleteOrder}
                     onEditOrder={handleUpdateOrder}
@@ -2178,6 +2224,8 @@ export default function App() {
                     orders={orders}
                     catalogue={catalogue}
                     reviews={reviews}
+                    boutiqueLogo={boutiqueLogo}
+                    boutiquePhone={boutiquePhone}
                     onAddReview={handleAddReview}
                     onAddOrder={handleAddOrder}
                     onUpdateOrders={saveOrdersToStorage}

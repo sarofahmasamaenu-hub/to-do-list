@@ -56,13 +56,24 @@ import {
 interface OrderTrackerProps {
   orders: Order[];
   catalogue?: CatalogueItem[];
+  boutiqueLogo?: string;
+  boutiquePhone?: string;
   onUpdateOrderStatus: (orderId: string, nextStatus: OrderStatus, customStatusDate?: string, note?: string) => void;
   onDeleteOrder: (orderId: string) => void;
   onEditOrder?: (updatedOrder: Order) => void;
   onConfirmPickupSignature?: (orderId: string, signatureDataUrl: string, signeeName: string, signedAt: string) => void;
 }
 
-export default function OrderTracker({ orders, catalogue = [], onUpdateOrderStatus, onDeleteOrder, onEditOrder, onConfirmPickupSignature }: OrderTrackerProps) {
+export default function OrderTracker({ 
+  orders, 
+  catalogue = [], 
+  boutiqueLogo,
+  boutiquePhone,
+  onUpdateOrderStatus, 
+  onDeleteOrder, 
+  onEditOrder, 
+  onConfirmPickupSignature 
+}: OrderTrackerProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL_ACTIVE'); // ALL, ALL_ACTIVE, or specific status
   const [branchFilter, setBranchFilter] = useState<string>('ALL');
@@ -2714,6 +2725,8 @@ export default function OrderTracker({ orders, catalogue = [], onUpdateOrderStat
         order={printingOrder} 
         isOpen={printingOrder !== null} 
         onClose={() => setPrintingOrder(null)} 
+        boutiqueLogo={boutiqueLogo}
+        boutiquePhone={boutiquePhone}
       />
 
       {/* Google Sheets Export Modal */}

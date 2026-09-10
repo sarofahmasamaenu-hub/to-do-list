@@ -43,6 +43,8 @@ interface CustomerPortalProps {
   orders: Order[];
   catalogue: CatalogueItem[];
   reviews?: CustomerReview[];
+  boutiqueLogo?: string;
+  boutiquePhone?: string;
   onAddReview?: (newReview: CustomerReview) => void;
   onAddOrder: (newOrder: Order) => void;
   onUpdateOrders?: (updatedOrders: Order[]) => void;
@@ -54,6 +56,8 @@ export default function CustomerPortal({
   orders, 
   catalogue, 
   reviews = [], 
+  boutiqueLogo: propBoutiqueLogo,
+  boutiquePhone: propBoutiquePhone,
   onAddReview, 
   onAddOrder, 
   onUpdateOrders, 
@@ -62,7 +66,8 @@ export default function CustomerPortal({
 }: CustomerPortalProps) {
   // Retrieve custom LINE OA settings from localStorage (configured by admin)
   const lineOaId = localStorage.getItem('nunuh_line_oa_id') || '@237aynfq';
-  const boutiquePhone = localStorage.getItem('nunuh_boutique_phone') || '086-555-1234';
+  const boutiquePhone = propBoutiquePhone || localStorage.getItem('nunuh_boutique_phone') || '086-555-1234';
+  const boutiqueLogo = propBoutiqueLogo || localStorage.getItem('nunuh_boutique_logo') || '';
 
   const getLineOaHref = (id: string) => {
     const clean = (id || '@237aynfq').trim().replace(/^@/, '');
@@ -2300,6 +2305,8 @@ export default function CustomerPortal({
         order={printingOrder} 
         isOpen={printingOrder !== null} 
         onClose={() => setPrintingOrder(null)} 
+        boutiqueLogo={boutiqueLogo}
+        boutiquePhone={boutiquePhone}
       />
     </div>
   );
