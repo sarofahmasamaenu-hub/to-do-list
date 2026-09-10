@@ -5,6 +5,17 @@ import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
+import { initializeApp as initFirebaseApp, getApps as getFirebaseApps, getApp as getFirebaseApp } from "firebase/app";
+import {
+  getFirestore,
+  collection,
+  doc,
+  deleteDoc,
+  setDoc,
+  onSnapshot,
+  arrayUnion,
+  getDocs
+} from "firebase/firestore";
 import {
   initDb,
   isPostgresActive,
@@ -238,6 +249,89 @@ async function readDeletedOrdersOnServer(): Promise<string[]> {
   return cachedDeletedOrders || [];
 }
 
+const firebaseConfig = {
+  apiKey: "AIzaSyDbt86w9Tl3HTlmlQwr4P7StoBKyEC56vc",
+  authDomain: "nuhpre-order.firebaseapp.com",
+  projectId: "nuhpre-order",
+  storageBucket: "nuhpre-order.firebasestorage.app",
+  messagingSenderId: "81774640286",
+  appId: "1:81774640286:web:e596d6d5bb638d11380f8f",
+  measurementId: "G-YNVY3Y03PY"
+};
+
+let firestoreDb: any = null;
+function getFirestoreDb() {
+  if (!firestoreDb) {
+    try {
+      const fbApp = getFirebaseApps().length > 0 ? getFirebaseApp() : initFirebaseApp(firebaseConfig);
+      firestoreDb = getFirestore(fbApp);
+    } catch (e) {
+      console.warn("Failed to initialize Firebase in server:", e);
+    }
+  }
+  return firestoreDb;
+}
+
+function initFirestoreSentinel() {
+  const db = getFirestoreDb();
+  if (!db) return;
+
+  console.log("[Firestore Sentinel] Active and guarding against zombie orders...");
+
+  // 1. Listen for changes in settings/deleted_orders from Firestore
+  try {
+    onSnapshot(doc(db, "settings", "deleted_orders"), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        if (data && Array.isArray(data.deletedIds)) {
+          const combined = Array.from(new Set([...(cachedDeletedOrders || []), ...data.deletedIds]));
+          if (combined.length > (cachedDeletedOrders || []).length) {
+            writeDeletedOrdersOnServer(combined);
+          }
+        }
+      }
+    }, (err) => {
+      console.warn("[Firestore Sentinel] deleted_orders subscription error:", err);
+    });
+  } catch (err) {
+    console.warn("[Firestore Sentinel] Failed to subscribe to deleted_orders:", err);
+  }
+
+  // 2. Real-time sentinel on orders collection:
+  // If ANY client (running old bundle or cached localStorage) writes a deleted order,
+  // IMMEDIATELY delete it from Firestore!
+  try {
+    onSnapshot(collection(db, "orders"), (snapshot) => {
+      snapshot.forEach(async (docSnap) => {
+        const orderId = docSnap.id;
+        if (cachedDeletedOrders && cachedDeletedOrders.includes(orderId)) {
+          console.warn(`[Firestore Sentinel] Zombie order detected in Firestore: ${orderId}. Purging immediately.`);
+          try {
+            await deleteDoc(doc(db, "orders", orderId));
+            broadcastSSEEvent("order_deleted", { deletedId: orderId, deletedIds: cachedDeletedOrders });
+          } catch (e) {
+            console.error(`[Firestore Sentinel] Error deleting zombie doc ${orderId}:`, e);
+          }
+        }
+      });
+    }, (err) => {
+      console.warn("[Firestore Sentinel] orders subscription error:", err);
+    });
+  } catch (err) {
+    console.warn("[Firestore Sentinel] Failed to subscribe to orders collection:", err);
+  }
+
+  // 3. Initial sweep on start:
+  getDocs(collection(db, "orders")).then((snap) => {
+    snap.forEach(async (docSnap) => {
+      if (cachedDeletedOrders && cachedDeletedOrders.includes(docSnap.id)) {
+        console.warn(`[Firestore Sentinel] Initial purge of zombie order ${docSnap.id}`);
+        await deleteDoc(doc(db, "orders", docSnap.id)).catch(() => {});
+      }
+    });
+  }).catch(() => {});
+}
+
 // Helper to write deleted order IDs
 async function writeDeletedOrdersOnServer(ids: string[], newDeletedId?: string) {
   cachedDeletedOrders = ids;
@@ -248,6 +342,20 @@ async function writeDeletedOrdersOnServer(ids: string[], newDeletedId?: string) 
     } catch (e) {
       console.error("Error deleting order in DB:", e);
     }
+  }
+
+  // Also sync to Firestore deleted_orders doc and delete doc from orders collection
+  const db = getFirestoreDb();
+  if (db) {
+    try {
+      setDoc(doc(db, "settings", "deleted_orders"), {
+        deletedIds: arrayUnion(...ids),
+        _syncedAt: new Date().toISOString()
+      }, { merge: true }).catch(() => {});
+      if (newDeletedId) {
+        deleteDoc(doc(db, "orders", newDeletedId)).catch(() => {});
+      }
+    } catch (e) {}
   }
 
   safeAtomicWriteJson(DELETED_ORDERS_FILE, ids);
@@ -502,6 +610,28 @@ app.get("/api/orders", async (req, res) => {
 app.get("/api/deleted-orders", async (req, res) => {
   const deletedIds = await readDeletedOrdersOnServer();
   res.json({ deletedIds });
+});
+
+app.delete("/api/orders", async (req: any, res) => {
+  const id = req.query?.id || req.body?.id;
+  if (!id) {
+    return res.status(400).json({ error: "Order id is required" });
+  }
+
+  const deletedIds = await readDeletedOrdersOnServer();
+  if (!deletedIds.includes(id)) {
+    deletedIds.push(id);
+    await writeDeletedOrdersOnServer(deletedIds, id);
+  }
+
+  const current = await readOrdersOnServer();
+  const updated = current.filter((o: any) => o.id !== id);
+  await writeOrdersOnServer(updated);
+
+  broadcastSSEEvent("order_deleted", { orders: updated, deletedId: id, deletedIds });
+  broadcastSSEEvent("orders_updated", { orders: updated, deletedId: id, deletedIds });
+
+  res.json({ success: true, orders: updated, deletedId: id, deletedIds });
 });
 
 app.delete("/api/orders/:id", async (req, res) => {
@@ -1223,6 +1353,9 @@ app.post("/api/chat/gemini", async (req, res) => {
 async function startServer() {
   // Initialize PostgreSQL tables if DATABASE_URL is available
   await initDb();
+
+  // Initialize real-time Firestore sentinel to purge any resurrected deleted orders
+  initFirestoreSentinel();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

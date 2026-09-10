@@ -8,7 +8,8 @@ import {
   getDocs,
   deleteDoc,
   onSnapshot,
-  getDocFromServer
+  getDocFromServer,
+  arrayUnion
 } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 import { Order, CatalogueItem } from './types';
@@ -58,11 +59,36 @@ export async function testFirestoreConnection(): Promise<{ success: boolean; lat
   }
 }
 
+// Global in-memory registry of deleted order IDs to guard against zombie saves
+const inMemoryDeletedIds = new Set<string>();
+
+// Initialize from localStorage if available
+if (typeof window !== 'undefined') {
+  try {
+    const raw = localStorage.getItem('nunuh_deleted_order_ids');
+    if (raw) {
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) {
+        arr.forEach(id => inMemoryDeletedIds.add(id));
+      }
+    }
+  } catch (e) {}
+}
+
+export function registerDeletedIdInMemory(id: string) {
+  if (id) inMemoryDeletedIds.add(id);
+}
+
 /**
  * Save / Update a single order in Firestore
  */
 export async function saveOrderToFirestore(order: Order): Promise<void> {
   if (!order || !order.id) return;
+  if (inMemoryDeletedIds.has(order.id)) {
+    console.warn(`[Firestore Guard] Blocked resurrecting deleted order ${order.id}`);
+    deleteDoc(doc(db, 'orders', order.id)).catch(() => {});
+    return;
+  }
   try {
     const orderDocRef = doc(db, 'orders', order.id);
     await setDoc(orderDocRef, {
@@ -80,7 +106,15 @@ export async function saveOrderToFirestore(order: Order): Promise<void> {
 export async function saveOrdersBatchToFirestore(orders: Order[]): Promise<void> {
   if (!orders || orders.length === 0) return;
   try {
-    const promises = orders.map(order => {
+    const validOrders = orders.filter(o => o && o.id && !inMemoryDeletedIds.has(o.id));
+    const deletedInBatch = orders.filter(o => o && o.id && inMemoryDeletedIds.has(o.id));
+    
+    // Purge any deleted orders if someone tried to batch-save them
+    for (const d of deletedInBatch) {
+      deleteDoc(doc(db, 'orders', d.id)).catch(() => {});
+    }
+
+    const promises = validOrders.map(order => {
       const orderDocRef = doc(db, 'orders', order.id);
       return setDoc(orderDocRef, {
         ...order,
@@ -98,6 +132,7 @@ export async function saveOrdersBatchToFirestore(orders: Order[]): Promise<void>
  */
 export async function deleteOrderFromFirestore(orderId: string): Promise<void> {
   if (!orderId) return;
+  inMemoryDeletedIds.add(orderId);
   try {
     const orderDocRef = doc(db, 'orders', orderId);
     await deleteDoc(orderDocRef);
@@ -105,23 +140,33 @@ export async function deleteOrderFromFirestore(orderId: string): Promise<void> {
     // Save to deleted_orders doc so all devices across the world sync the deletion in real-time
     const deletedDocRef = doc(db, 'settings', 'deleted_orders');
     try {
-      const docSnap = await getDoc(deletedDocRef);
-      const existingDeleted: string[] = docSnap.exists() && Array.isArray(docSnap.data()?.deletedIds)
-        ? docSnap.data().deletedIds
-        : [];
-      if (!existingDeleted.includes(orderId)) {
-        const updatedList = [...existingDeleted, orderId];
-        await setDoc(deletedDocRef, {
-          deletedIds: updatedList,
-          lastDeletedId: orderId,
-          _syncedAt: new Date().toISOString()
-        }, { merge: true });
-      }
+      await setDoc(deletedDocRef, {
+        deletedIds: arrayUnion(orderId),
+        lastDeletedId: orderId,
+        _syncedAt: new Date().toISOString()
+      }, { merge: true });
     } catch (err) {
       console.warn('Error recording deleted order in Firestore registry:', err);
     }
   } catch (e) {
     console.warn('Error deleting order from Firestore:', e);
+  }
+}
+
+/**
+ * Record multiple deleted order IDs into Firestore registry atomically
+ */
+export async function recordDeletedOrderIdsInFirestore(ids: string[]): Promise<void> {
+  if (!ids || ids.length === 0) return;
+  ids.forEach(id => inMemoryDeletedIds.add(id));
+  try {
+    const deletedDocRef = doc(db, 'settings', 'deleted_orders');
+    await setDoc(deletedDocRef, {
+      deletedIds: arrayUnion(...ids),
+      _syncedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (e) {
+    console.warn('Error recording deleted order IDs in Firestore:', e);
   }
 }
 
@@ -135,6 +180,7 @@ export async function fetchDeletedOrderIdsFromFirestore(): Promise<string[]> {
     if (docSnap.exists()) {
       const data = docSnap.data();
       if (data && Array.isArray(data.deletedIds)) {
+        data.deletedIds.forEach((id: string) => inMemoryDeletedIds.add(id));
         return data.deletedIds;
       }
     }
@@ -153,6 +199,7 @@ export function subscribeToDeletedOrders(onDeleted: (deletedIds: string[]) => vo
       if (snapshot.exists()) {
         const data = snapshot.data();
         if (data && Array.isArray(data.deletedIds)) {
+          data.deletedIds.forEach((id: string) => inMemoryDeletedIds.add(id));
           onDeleted(data.deletedIds);
         }
       }
@@ -246,8 +293,12 @@ export async function fetchOrdersFromFirestore(): Promise<Order[]> {
   try {
     const querySnapshot = await getDocs(collection(db, 'orders'));
     const orders: Order[] = [];
-    querySnapshot.forEach((doc) => {
-      orders.push(mapDocToOrder(doc));
+    querySnapshot.forEach((docSnap) => {
+      if (inMemoryDeletedIds.has(docSnap.id)) {
+        deleteDoc(doc(db, 'orders', docSnap.id)).catch(() => {});
+      } else {
+        orders.push(mapDocToOrder(docSnap));
+      }
     });
     return orders;
   } catch (e) {
@@ -272,8 +323,15 @@ export function subscribeToOrders(onUpdate: (orders: Order[], removedIds: string
         }
       });
 
-      snapshot.forEach((doc) => {
-        updatedOrders.push(mapDocToOrder(doc));
+      snapshot.forEach((docSnap) => {
+        if (inMemoryDeletedIds.has(docSnap.id)) {
+          deleteDoc(doc(db, 'orders', docSnap.id)).catch(() => {});
+          if (!removedIds.includes(docSnap.id)) {
+            removedIds.push(docSnap.id);
+          }
+        } else {
+          updatedOrders.push(mapDocToOrder(docSnap));
+        }
       });
 
       onUpdate(updatedOrders, removedIds);
@@ -443,6 +501,10 @@ export async function syncAllLocalOrdersToFirestore(orders: Order[]): Promise<{ 
     let synced = 0;
     for (const order of orders) {
       if (order && order.id) {
+        if (inMemoryDeletedIds.has(order.id)) {
+          deleteDoc(doc(db, 'orders', order.id)).catch(() => {});
+          continue;
+        }
         const orderDocRef = doc(db, 'orders', order.id);
         await setDoc(orderDocRef, {
           ...order,

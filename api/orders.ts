@@ -98,7 +98,19 @@ export default async function handler(req: any, res: any) {
 
     if (req.method === "POST") {
       const { orders: incomingOrders } = req.body || {};
-      const ordersToSave = Array.isArray(incomingOrders) ? incomingOrders : (Array.isArray(req.body) ? req.body : []);
+      const rawOrders = Array.isArray(incomingOrders) ? incomingOrders : (Array.isArray(req.body) ? req.body : []);
+
+      let deletedIds: string[] = [];
+      if (db.isPostgresActive()) {
+        try {
+          deletedIds = await db.getDeletedOrderIdsFromDb();
+        } catch (e) {}
+      }
+      if (!deletedIds || deletedIds.length === 0) {
+        deletedIds = readDeletedOrdersFromFile();
+      }
+      const deletedSet = new Set(deletedIds);
+      const ordersToSave = rawOrders.filter((o: any) => o && o.id && !deletedSet.has(o.id));
 
       if (ordersToSave.length > 0 && db.isPostgresActive()) {
         try {
@@ -124,11 +136,20 @@ export default async function handler(req: any, res: any) {
         writeOrdersToFile(currentDbOrders);
       }
 
-      return res.status(200).json(currentDbOrders);
+      const cleanDbOrders = (currentDbOrders || []).filter((o: any) => o && o.id && !deletedSet.has(o.id));
+      return res.status(200).json(cleanDbOrders);
     }
 
     if (req.method === "DELETE") {
-      const id = req.query?.id || req.body?.id;
+      let id = req.query?.id || req.body?.id;
+      if (!id && req.url) {
+        const parts = req.url.split("?")[0].split("/");
+        const last = parts[parts.length - 1];
+        if (last && last !== "orders") {
+          id = last;
+        }
+      }
+
       if (!id) {
         return res.status(400).json({ error: "Order id is required" });
       }

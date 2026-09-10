@@ -41,9 +41,10 @@ export default async function handler(req: any, res: any) {
       deletedIds = readDeletedOrdersFromFile();
     }
 
-    return res.status(200).json(deletedIds || []);
+    const list = deletedIds || [];
+    return res.status(200).json({ deletedIds: list, ids: list });
   } catch (err: any) {
     console.error("[Vercel deleted-orders.ts] Error:", err);
-    return res.status(200).json([]);
+    return res.status(200).json({ deletedIds: [], ids: [] });
   }
 }

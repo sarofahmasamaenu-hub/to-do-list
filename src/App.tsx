@@ -18,6 +18,7 @@ import {
   saveOrderToFirestore,
   saveOrdersBatchToFirestore,
   deleteOrderFromFirestore,
+  recordDeletedOrderIdsInFirestore,
   fetchDeletedOrderIdsFromFirestore,
   subscribeToDeletedOrders,
   fetchOrdersFromFirestore,
@@ -567,8 +568,12 @@ export default function App() {
         const delRes = await fetch('/api/deleted-orders');
         if (delRes.ok) {
           const delData = await delRes.json();
-          if (Array.isArray(delData.deletedIds)) {
+          if (Array.isArray(delData)) {
+            serverDeleted = delData;
+          } else if (Array.isArray(delData?.deletedIds)) {
             serverDeleted = delData.deletedIds;
+          } else if (Array.isArray(delData?.ids)) {
+            serverDeleted = delData.ids;
           }
         }
       } catch (e) {}
@@ -588,6 +593,11 @@ export default function App() {
       }
       const deletedSet = new Set(allDeleted);
 
+      // ส่ง ID ที่ถูกลบไปบันทึกบน Firestore registry ให้ทุกเครื่องทั่วโลกรู้ทันที
+      if (allDeleted.length > (firestoreDeleted?.length || 0)) {
+        recordDeletedOrderIdsInFirestore(allDeleted).catch(() => {});
+      }
+
       const storedLocal = localStorage.getItem('nunuh_orders');
       let currentLocal: Order[] = [];
       if (storedLocal) {
@@ -600,55 +610,94 @@ export default function App() {
 
       // 1. Fetch latest from server / database
       let fetchedFromServer: Order[] = [];
+      let serverReturned = false;
       try {
         const getRes = await fetch('/api/orders');
         if (getRes.ok) {
           const data = await getRes.json();
           if (Array.isArray(data)) {
+            serverReturned = true;
             fetchedFromServer = data.filter(o => o && o.id && !deletedSet.has(o.id));
           }
         }
       } catch (e) {}
 
-      let combined = mergeOrders(currentLocal, fetchedFromServer);
+      // 2. Fetch from Firebase Firestore
+      let fetchedFromFirestore: Order[] = [];
+      let firestoreReturned = false;
+      try {
+        const firestoreOrders = await fetchOrdersFromFirestore();
+        if (firestoreOrders && Array.isArray(firestoreOrders)) {
+          firestoreReturned = true;
+          fetchedFromFirestore = firestoreOrders.filter(o => o && o.id && !deletedSet.has(o.id));
+        }
+      } catch (e) {}
+
+      // รวมข้อมูลจาก Remote (Server + Firestore) เป็นศูนย์กลางความถูกต้อง (Single Source of Truth)
+      const remoteOrders = mergeOrders(fetchedFromServer, fetchedFromFirestore).filter(o => o && o.id && !deletedSet.has(o.id));
+      const hasRemoteData = serverReturned || firestoreReturned;
+
+      let combined: Order[] = [];
+      if (hasRemoteData) {
+        const remoteIds = new Set(remoteOrders.map(o => o.id));
+        const now = Date.now();
+
+        // เก็บออเดอร์ในเครื่องไว้เฉพาะออเดอร์ที่เพิ่งสร้างใหม่สดๆ ภายใน 60 วินาทีที่ยังซิงค์ไม่เสร็จ
+        const pendingLocal = currentLocal.filter(o => {
+          if (!o || !o.id || deletedSet.has(o.id)) return false;
+          if (remoteIds.has(o.id)) return false;
+          return o.updatedAt && (now - o.updatedAt < 60000);
+        });
+
+        // ออเดอร์ในเครื่องที่เก่าเกิน 60 วินาทีและไม่มีอยู่บนเซิร์ฟเวอร์/Firestore คือออเดอร์ที่ถูกลบไปแล้วจากเครื่องอื่น
+        const deadLocalOrders = currentLocal.filter(o => o && o.id && !remoteIds.has(o.id) && (!o.updatedAt || (now - o.updatedAt >= 60000)));
+        if (deadLocalOrders.length > 0) {
+          const deadIds = deadLocalOrders.map(o => o.id);
+          const updatedDeleted = Array.from(new Set([...allDeleted, ...deadIds]));
+          localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(updatedDeleted));
+          recordDeletedOrderIdsInFirestore(deadIds).catch(() => {});
+        }
+
+        combined = mergeOrders(remoteOrders, pendingLocal);
+      } else {
+        // กรณีออฟไลน์สนิท (ไม่สามารถเชื่อมต่อ Server หรือ Firestore ได้)
+        combined = currentLocal.filter(o => o && o.id && !deletedSet.has(o.id));
+      }
+
+      // หากมีออเดอร์ที่สั่งให้อัปโหลดโดยเฉพาะ (เช่น เพิ่งสร้างหรือแก้ไข)
       if (ordersToUpload && ordersToUpload.length > 0) {
         const cleanUpload = ordersToUpload.filter(o => o && o.id && !deletedSet.has(o.id));
         combined = mergeOrders(combined, cleanUpload);
       }
-
-      // 2. Try fetching from Firebase Firestore as well
-      try {
-        const firestoreOrders = await fetchOrdersFromFirestore();
-        if (firestoreOrders && firestoreOrders.length > 0) {
-          const cleanFirestore = firestoreOrders.filter(o => o && o.id && !deletedSet.has(o.id));
-          combined = mergeOrders(combined, cleanFirestore);
-        }
-      } catch (e) {}
 
       setOrders(combined);
       safeSetLocalStorage('nunuh_orders', combined);
       
       const publicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
 
-      if (combined.length > 0) {
-        // Also ensure clean orders are saved to Firestore in background
+      // **สำคัญมาก**: อัปโหลดขึ้น Server/Firestore เฉพาะเมื่อมีคำสั่งบันทึกจริง (ordersToUpload)
+      // หรือเมื่อเซิร์ฟเวอร์ว่างเปล่า 0 รายการเพื่อ Bootstrap ไม่ทำในรอบโพลลิ่งพื้นหลัง
+      const shouldUpload = (ordersToUpload && ordersToUpload.length > 0) || (!hasRemoteData && currentLocal.length > 0);
+      if (shouldUpload && combined.length > 0) {
         saveOrdersBatchToFirestore(combined).catch(() => {});
 
-        const response = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ orders: combined, publicUrl })
-        });
-        
-        if (response.ok) {
-          const mergedFromServer = await response.json();
-          if (Array.isArray(mergedFromServer) && mergedFromServer.length > 0) {
-            const cleanFinal = mergedFromServer.filter(o => o && o.id && !deletedSet.has(o.id));
-            const finalMerged = mergeOrders(combined, cleanFinal);
-            setOrders(finalMerged);
-            safeSetLocalStorage('nunuh_orders', finalMerged);
+        try {
+          const response = await fetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ orders: combined, publicUrl })
+          });
+          
+          if (response.ok) {
+            const mergedFromServer = await response.json();
+            if (Array.isArray(mergedFromServer) && mergedFromServer.length > 0) {
+              const cleanFinal = mergedFromServer.filter(o => o && o.id && !deletedSet.has(o.id));
+              const finalMerged = mergeOrders(combined, cleanFinal);
+              setOrders(finalMerged);
+              safeSetLocalStorage('nunuh_orders', finalMerged);
+            }
           }
-        }
+        } catch (e) {}
       }
     } catch (e) {
       console.warn('Backend sync is temporarily unavailable, running in local-only mode:', e);
@@ -1315,33 +1364,38 @@ export default function App() {
     return () => clearInterval(interval);
   }, [currentStaff, isStaffMode, isCustomerMode]);
 
-  // ซิงค์ออเดอร์ทั้งหมดขึ้น Firebase Firestore ทุกครั้งที่เปิดแอปหรือจำนวนออเดอร์เปลี่ยน
-  useEffect(() => {
-    if (orders.length > 0) {
-      syncAllLocalOrdersToFirestore(orders).catch(() => {});
-    }
-  }, [orders.length]);
-
   // บันทึกข้อมูลลง LocalStorage พร้อมผสานข้อมูลป้องกันการชนกัน (Concurrent Save Safety)
   const saveOrdersToStorage = (updatedOrders: Order[], deletedId?: string) => {
     try {
+      const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
+      let deletedIds: string[] = [];
+      try { deletedIds = JSON.parse(deletedIdsStr); } catch (e) {}
+      if (deletedId && !deletedIds.includes(deletedId)) {
+        deletedIds.push(deletedId);
+        localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(deletedIds));
+      }
+      const deletedSet = new Set(deletedIds);
+
       const stored = localStorage.getItem('nunuh_orders');
       let currentStored: Order[] = [];
       if (stored) {
-        currentStored = JSON.parse(stored);
+        try {
+          currentStored = JSON.parse(stored);
+        } catch (e) {}
       }
+      const cleanStored = currentStored.filter(o => o && o.id && !deletedSet.has(o.id));
+      const cleanUpdated = updatedOrders.filter(o => o && o.id && !deletedSet.has(o.id));
+
       // ผสานระหว่างข้อมูลที่มีอยู่ล่าสุดในเครื่อง กับข้อมูลที่กำลังบันทึกใหม่
-      let fullyMerged = mergeOrders(currentStored, updatedOrders);
-      if (deletedId) {
-        fullyMerged = fullyMerged.filter(o => o.id !== deletedId);
-      }
+      let fullyMerged = mergeOrders(cleanStored, cleanUpdated);
+      fullyMerged = fullyMerged.filter(o => o && o.id && !deletedSet.has(o.id));
       
       setOrders(fullyMerged);
       safeSetLocalStorage('nunuh_orders', fullyMerged);
 
-      // ซิงค์ส่งขึ้น Firestore และ Server ทันที
-      syncAllLocalOrdersToFirestore(fullyMerged).catch(() => {});
-      syncWithServer(fullyMerged);
+      // บันทึกเฉพาะออเดอร์ที่ถูกแก้ไข/เพิ่มใหม่ขึ้น Firestore และ Server
+      saveOrdersBatchToFirestore(cleanUpdated).catch(() => {});
+      syncWithServer(cleanUpdated);
 
       // ส่งสัญญาณ BroadcastChannel ไปยังแท็บหรืออุปกรณ์อื่นทันที
       try {
@@ -1350,14 +1404,16 @@ export default function App() {
         channel.close();
       } catch (e) {}
     } catch (e) {
-      let finalOrders = updatedOrders;
-      if (deletedId) {
-        finalOrders = finalOrders.filter(o => o.id !== deletedId);
-      }
-      setOrders(finalOrders);
-      safeSetLocalStorage('nunuh_orders', finalOrders);
-      syncAllLocalOrdersToFirestore(finalOrders).catch(() => {});
-      syncWithServer(finalOrders);
+      const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
+      let deletedIds: string[] = [];
+      try { deletedIds = JSON.parse(deletedIdsStr); } catch (err) {}
+      const deletedSet = new Set(deletedIds);
+
+      const cleanFinal = updatedOrders.filter(o => o && o.id && !deletedSet.has(o.id) && o.id !== deletedId);
+      setOrders(cleanFinal);
+      safeSetLocalStorage('nunuh_orders', cleanFinal);
+      saveOrdersBatchToFirestore(cleanFinal).catch(() => {});
+      syncWithServer(cleanFinal);
     }
   };
 
@@ -1455,6 +1511,7 @@ export default function App() {
       deletedIds.push(orderId);
       localStorage.setItem('nunuh_deleted_order_ids', JSON.stringify(deletedIds));
     }
+    recordDeletedOrderIdsInFirestore([orderId]).catch(() => {});
 
     // 2. ปรับปรุงสถานะ Local และเซฟแบบคลีนทันที
     const updated = orders.filter(o => o.id !== orderId);
@@ -1471,9 +1528,10 @@ export default function App() {
     // 4. ลบออกจากระบบเซิร์ฟเวอร์และ Firestore โดยตรงทันที (ซึ่งจะยิง SSE กระจายให้ผู้ใช้อื่นที่อยู่ต่างอุปกรณ์ด้วย)
     deleteOrderFromFirestore(orderId).catch(() => {});
     try {
-      await fetch(`/api/orders/${orderId}`, {
-        method: 'DELETE'
-      });
+      await Promise.allSettled([
+        fetch(`/api/orders/${orderId}`, { method: 'DELETE' }),
+        fetch(`/api/orders?id=${encodeURIComponent(orderId)}`, { method: 'DELETE' })
+      ]);
     } catch (err) {
       console.warn("Server delete failed, will sync later:", err);
     }
