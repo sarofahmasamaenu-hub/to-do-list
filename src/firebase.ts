@@ -269,3 +269,95 @@ export async function saveCatalogueToFirestore(items: CatalogueItem[]): Promise<
     console.warn('Error saving catalogue to Firestore:', e);
   }
 }
+
+/**
+ * Register or update staff / active user online heartbeat in Firestore
+ */
+export async function registerStaffOnline(staff: { id: string; name: string; branch: string; role?: string }): Promise<void> {
+  if (!staff || !staff.id) return;
+  try {
+    const presenceRef = doc(db, 'online_staff', staff.id);
+    await setDoc(presenceRef, {
+      id: staff.id,
+      name: staff.name,
+      branch: staff.branch || 'สาขาหลัก',
+      role: staff.role || 'Staff',
+      lastActive: Date.now(),
+      _updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (e) {
+    console.warn('Error recording staff presence in Firestore:', e);
+  }
+}
+
+/**
+ * Remove staff from online roster upon logout
+ */
+export async function removeStaffOnline(staffId: string): Promise<void> {
+  if (!staffId) return;
+  try {
+    const presenceRef = doc(db, 'online_staff', staffId);
+    await deleteDoc(presenceRef);
+  } catch (e) {
+    console.warn('Error removing staff presence in Firestore:', e);
+  }
+}
+
+/**
+ * Listen for real-time online staff and active users across all devices
+ */
+export function subscribeToOnlineStaff(
+  onUpdate: (activeStaff: Array<{ id: string; name: string; branch: string; loginTime?: number; lastActive?: number }>) => void
+): () => void {
+  try {
+    const unsubscribe = onSnapshot(collection(db, 'online_staff'), (snapshot) => {
+      const activeList: Array<{ id: string; name: string; branch: string; loginTime?: number; lastActive?: number }> = [];
+      const now = Date.now();
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        // Only count sessions active in the last 2 minutes
+        if (data && data.lastActive && (now - data.lastActive) < 120000) {
+          activeList.push({
+            id: data.id || docSnap.id,
+            name: data.name || 'พนักงานห้องเสื้อ',
+            branch: data.branch || 'สาขาหลัก',
+            loginTime: data.loginTime || data.lastActive,
+            lastActive: data.lastActive
+          });
+        }
+      });
+      onUpdate(activeList);
+    }, (err) => {
+      console.warn('Online staff listener error:', err);
+    });
+    return unsubscribe;
+  } catch (e) {
+    console.warn('Could not subscribe to online staff:', e);
+    return () => {};
+  }
+}
+
+/**
+ * Force sync all local orders to Firestore
+ */
+export async function syncAllLocalOrdersToFirestore(orders: Order[]): Promise<{ count: number; success: boolean; error?: string }> {
+  if (!orders || orders.length === 0) return { count: 0, success: true };
+  try {
+    let synced = 0;
+    for (const order of orders) {
+      if (order && order.id) {
+        const orderDocRef = doc(db, 'orders', order.id);
+        await setDoc(orderDocRef, {
+          ...order,
+          _syncedAt: new Date().toISOString()
+        }, { merge: true });
+        synced++;
+      }
+    }
+    return { count: synced, success: true };
+  } catch (e: any) {
+    console.warn('Error syncing all orders to Firestore:', e);
+    return { count: 0, success: false, error: e?.message || 'Sync failed' };
+  }
+}
+

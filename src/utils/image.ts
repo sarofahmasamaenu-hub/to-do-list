@@ -12,9 +12,9 @@ export interface CompressImageOptions {
 
 export function compressImage(
   file: File | Blob,
-  maxWidth = 1200,
-  maxHeight = 1200,
-  quality = 0.8
+  maxWidth = 800,
+  maxHeight = 800,
+  quality = 0.72
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     if (file.type && !file.type.startsWith('image/')) {

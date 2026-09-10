@@ -8,6 +8,12 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Order, OrderStatus, STATUS_MAP, CatalogueItem, CustomerReview } from './types';
 import { INITIAL_ORDERS, INITIAL_CATALOGUE, INITIAL_REVIEWS } from './initialData';
 import { playNewOrderSound } from './utils/sound';
+import { 
+  safeSetLocalStorage, 
+  safeGetLocalStorage, 
+  safeRemoveLocalStorage, 
+  compactOrdersListForCache 
+} from './utils/storage';
 import {
   saveOrderToFirestore,
   saveOrdersBatchToFirestore,
@@ -16,7 +22,11 @@ import {
   subscribeToOrders,
   saveSettingsToFirestore,
   saveCatalogueToFirestore,
-  testFirestoreConnection
+  testFirestoreConnection,
+  registerStaffOnline,
+  removeStaffOnline,
+  subscribeToOnlineStaff,
+  syncAllLocalOrdersToFirestore
 } from './firebase';
 
 // Components
@@ -145,12 +155,20 @@ export default function App() {
 
   const handleStaffLogin = (name: string, branch: string) => {
     const newStaff = { id: 'staff-' + Date.now() + '-' + Math.random().toString(36).substring(2, 5), name: name.trim(), branch: branch.trim(), loginTime: Date.now() };
-    const updatedList = [newStaff, ...activeStaffList];
+    const updatedList = [newStaff, ...activeStaffList.filter(s => s.name !== newStaff.name || s.branch !== newStaff.branch)];
     setActiveStaffList(updatedList);
     localStorage.setItem('nunuh_active_staff_list', JSON.stringify(updatedList));
     setCurrentStaff({ id: newStaff.id, name: newStaff.name, branch: newStaff.branch });
     localStorage.setItem('nunuh_logged_in_staff', JSON.stringify({ id: newStaff.id, name: newStaff.name, branch: newStaff.branch }));
     setShowAddStaffModal(false);
+
+    // Register presence in Firebase Firestore
+    registerStaffOnline({
+      id: newStaff.id,
+      name: newStaff.name,
+      branch: newStaff.branch,
+      role: 'Staff'
+    });
 
     // Sync login session to backend server
     fetch('/api/staff/heartbeat', {
@@ -180,6 +198,9 @@ export default function App() {
       }
     }
 
+    // Remove presence from Firebase Firestore
+    removeStaffOnline(id);
+
     // Broadcast channel signal to immediately sync across open browser tabs
     try {
       const channel = new BroadcastChannel('nunuh_multiuser_sync_channel');
@@ -196,6 +217,9 @@ export default function App() {
   };
 
   const handleStaffLogout = () => {
+    if (currentStaff?.id) {
+      removeStaffOnline(currentStaff.id);
+    }
     setActiveStaffList([]);
     setCurrentStaff(null);
     localStorage.removeItem('nunuh_active_staff_list');
@@ -262,6 +286,46 @@ export default function App() {
   const [copiedWebhook, setCopiedWebhook] = useState<boolean>(false);
   const [isTestingFirebase, setIsTestingFirebase] = useState<boolean>(false);
   const [firebaseTestResult, setFirebaseTestResult] = useState<{ success: boolean; latencyMs?: number; projectId?: string; message: string } | null>(null);
+  const [isForceSyncingFirebase, setIsForceSyncingFirebase] = useState<boolean>(false);
+  const [forceSyncResult, setForceSyncResult] = useState<{ success: boolean; count: number; message: string } | null>(null);
+
+  const handleForceSyncAllOrdersToFirebase = async () => {
+    setIsForceSyncingFirebase(true);
+    setForceSyncResult(null);
+    try {
+      // 1. Force upload all local orders to Firestore
+      const res = await syncAllLocalOrdersToFirestore(orders);
+      // 2. Also save settings and catalogue to Firestore
+      saveSettingsToFirestore({
+        boutiquePhone,
+        boutiqueLogo,
+        theme,
+        lineChannelAccessToken,
+        lineChannelSecret,
+        ownerLineUserId,
+        lineOaId,
+        lineOaChatUrl,
+        publicUrl: localStorage.getItem('nunuh_public_url') || window.location.origin
+      }).catch(() => {});
+      if (catalogue && catalogue.length > 0) {
+        saveCatalogueToFirestore(catalogue).catch(() => {});
+      }
+
+      setForceSyncResult({
+        success: true,
+        count: res.count,
+        message: `🎉 อัปโหลดและซิงค์ข้อมูล ${res.count} รายการขึ้น Firebase Cloud สำเร็จ 100%! ทุกเครื่องที่เปิดลิงก์จะเห็นข้อมูลตรงกันทันที`
+      });
+    } catch (err: any) {
+      setForceSyncResult({
+        success: false,
+        count: 0,
+        message: `⚠️ เกิดข้อผิดพลาดในการซิงค์: ${err?.message || err}`
+      });
+    } finally {
+      setIsForceSyncingFirebase(false);
+    }
+  };
 
   const fetchLineConfigStatus = async () => {
     try {
@@ -495,7 +559,7 @@ export default function App() {
       } catch (e) {}
 
       setOrders(combined);
-      localStorage.setItem('nunuh_orders', JSON.stringify(combined));
+      safeSetLocalStorage('nunuh_orders', combined);
       
       const publicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
 
@@ -514,7 +578,7 @@ export default function App() {
           if (Array.isArray(mergedFromServer) && mergedFromServer.length > 0) {
             const finalMerged = mergeOrders(combined, mergedFromServer);
             setOrders(finalMerged);
-            localStorage.setItem('nunuh_orders', JSON.stringify(finalMerged));
+            safeSetLocalStorage('nunuh_orders', finalMerged);
           }
         }
       }
@@ -534,7 +598,7 @@ export default function App() {
         const serverCat = await res.json();
         if (Array.isArray(serverCat) && serverCat.length > 0) {
           setCatalogue(serverCat);
-          localStorage.setItem('nunuh_catalogue', JSON.stringify(serverCat));
+          safeSetLocalStorage('nunuh_catalogue', serverCat);
         } else {
           // If server is empty, upload local catalogue
           const localCat = localStorage.getItem('nunuh_catalogue');
@@ -559,38 +623,38 @@ export default function App() {
         if (serverSettings && typeof serverSettings === 'object' && Object.keys(serverSettings).length > 0) {
           if (serverSettings.boutiquePhone) {
             setBoutiquePhone(serverSettings.boutiquePhone);
-            localStorage.setItem('nunuh_boutique_phone', serverSettings.boutiquePhone);
+            safeSetLocalStorage('nunuh_boutique_phone', serverSettings.boutiquePhone);
           }
           if (serverSettings.boutiqueLogo !== undefined) {
             setBoutiqueLogo(serverSettings.boutiqueLogo);
-            localStorage.setItem('nunuh_boutique_logo', serverSettings.boutiqueLogo);
+            safeSetLocalStorage('nunuh_boutique_logo', serverSettings.boutiqueLogo);
           }
           if (serverSettings.theme) {
             setTheme(serverSettings.theme);
-            localStorage.setItem('nunuh_selected_theme', serverSettings.theme);
+            safeSetLocalStorage('nunuh_selected_theme', serverSettings.theme);
           }
           if (serverSettings.lineChannelAccessToken) {
             setLineChannelAccessToken(serverSettings.lineChannelAccessToken);
-            localStorage.setItem('nunuh_line_channel_access_token', serverSettings.lineChannelAccessToken);
+            safeSetLocalStorage('nunuh_line_channel_access_token', serverSettings.lineChannelAccessToken);
           }
           if (serverSettings.lineChannelSecret) {
             setLineChannelSecret(serverSettings.lineChannelSecret);
-            localStorage.setItem('nunuh_line_channel_secret', serverSettings.lineChannelSecret);
+            safeSetLocalStorage('nunuh_line_channel_secret', serverSettings.lineChannelSecret);
           }
           if (serverSettings.ownerLineUserId) {
             setOwnerLineUserId(serverSettings.ownerLineUserId);
-            localStorage.setItem('nunuh_owner_line_user_id', serverSettings.ownerLineUserId);
+            safeSetLocalStorage('nunuh_owner_line_user_id', serverSettings.ownerLineUserId);
           }
           if (serverSettings.lineOaId) {
             setLineOaId(serverSettings.lineOaId);
-            localStorage.setItem('nunuh_line_oa_id', serverSettings.lineOaId);
+            safeSetLocalStorage('nunuh_line_oa_id', serverSettings.lineOaId);
           }
           if (serverSettings.lineOaChatUrl) {
             setLineOaChatUrl(serverSettings.lineOaChatUrl);
-            localStorage.setItem('nunuh_line_oa_chat_url', serverSettings.lineOaChatUrl);
+            safeSetLocalStorage('nunuh_line_oa_chat_url', serverSettings.lineOaChatUrl);
           }
           if (serverSettings.publicUrl) {
-            localStorage.setItem('nunuh_public_url', serverSettings.publicUrl);
+            safeSetLocalStorage('nunuh_public_url', serverSettings.publicUrl);
           }
         } else {
           // If server is empty, upload local settings
@@ -632,7 +696,7 @@ export default function App() {
         const serverReviews = await res.json();
         if (Array.isArray(serverReviews) && serverReviews.length > 0) {
           setReviews(serverReviews);
-          localStorage.setItem('nunuh_reviews', JSON.stringify(serverReviews));
+          safeSetLocalStorage('nunuh_reviews', serverReviews);
         } else {
           // If server is empty, upload local reviews
           const localRev = localStorage.getItem('nunuh_reviews');
@@ -656,7 +720,7 @@ export default function App() {
         const serverStaff = await res.json();
         if (Array.isArray(serverStaff)) {
           setActiveStaffList(serverStaff);
-          localStorage.setItem('nunuh_active_staff_list', JSON.stringify(serverStaff));
+          safeSetLocalStorage('nunuh_active_staff_list', serverStaff);
         }
       }
     } catch (e) {
@@ -681,7 +745,7 @@ export default function App() {
       }
     }
     setOrders(initialOrders);
-    localStorage.setItem('nunuh_orders', JSON.stringify(initialOrders));
+    safeSetLocalStorage('nunuh_orders', initialOrders);
 
     const savedCatalogue = localStorage.getItem('nunuh_catalogue');
     if (savedCatalogue) {
@@ -697,18 +761,18 @@ export default function App() {
         if (missingItems.length > 0) {
           const merged = [...parsed, ...missingItems];
           setCatalogue(merged);
-          localStorage.setItem('nunuh_catalogue', JSON.stringify(merged));
+          safeSetLocalStorage('nunuh_catalogue', merged);
         } else {
           setCatalogue(parsed);
-          localStorage.setItem('nunuh_catalogue', JSON.stringify(parsed));
+          safeSetLocalStorage('nunuh_catalogue', parsed);
         }
       } catch (e) {
         setCatalogue(INITIAL_CATALOGUE);
-        localStorage.setItem('nunuh_catalogue', JSON.stringify(INITIAL_CATALOGUE));
+        safeSetLocalStorage('nunuh_catalogue', INITIAL_CATALOGUE);
       }
     } else {
       setCatalogue(INITIAL_CATALOGUE);
-      localStorage.setItem('nunuh_catalogue', JSON.stringify(INITIAL_CATALOGUE));
+      safeSetLocalStorage('nunuh_catalogue', INITIAL_CATALOGUE);
     }
 
     const savedReviews = localStorage.getItem('nunuh_reviews');
@@ -721,18 +785,18 @@ export default function App() {
         if (missingReviews.length > 0) {
           const merged = [...parsed, ...missingReviews];
           setReviews(merged);
-          localStorage.setItem('nunuh_reviews', JSON.stringify(merged));
+          safeSetLocalStorage('nunuh_reviews', merged);
         } else {
           setReviews(parsed);
-          localStorage.setItem('nunuh_reviews', JSON.stringify(parsed));
+          safeSetLocalStorage('nunuh_reviews', parsed);
         }
       } catch (e) {
         setReviews(INITIAL_REVIEWS);
-        localStorage.setItem('nunuh_reviews', JSON.stringify(INITIAL_REVIEWS));
+        safeSetLocalStorage('nunuh_reviews', INITIAL_REVIEWS);
       }
     } else {
       setReviews(INITIAL_REVIEWS);
-      localStorage.setItem('nunuh_reviews', JSON.stringify(INITIAL_REVIEWS));
+      safeSetLocalStorage('nunuh_reviews', INITIAL_REVIEWS);
     }
 
     const params = new URLSearchParams(window.location.search);
@@ -902,7 +966,7 @@ export default function App() {
             const deletedSet = new Set(deletedIds);
             setOrders(prev => {
               const filtered = prev.filter(o => !deletedSet.has(o.id));
-              localStorage.setItem('nunuh_orders', JSON.stringify(filtered));
+              safeSetLocalStorage('nunuh_orders', filtered);
               return filtered;
             });
           }
@@ -955,9 +1019,23 @@ export default function App() {
 
         setOrders(prev => {
           const merged = mergeOrders(prev, cleanFirestore);
-          localStorage.setItem('nunuh_orders', JSON.stringify(merged));
+          safeSetLocalStorage('nunuh_orders', merged);
           return merged;
         });
+      }
+    });
+
+    // ติดตั้ง Firebase Firestore Real-time Listener สำหรับสถานะพนักงานออนไลน์
+    const unsubscribeStaff = subscribeToOnlineStaff((onlineStaffList) => {
+      if (onlineStaffList && Array.isArray(onlineStaffList)) {
+        const normalizedStaffList = onlineStaffList.map(s => ({
+          id: s.id,
+          name: s.name,
+          branch: s.branch,
+          loginTime: s.loginTime || Date.now()
+        }));
+        setActiveStaffList(normalizedStaffList);
+        safeSetLocalStorage('nunuh_active_staff_list', normalizedStaffList);
       }
     });
 
@@ -969,32 +1047,55 @@ export default function App() {
       clearInterval(pollInterval);
       clearInterval(serverPollInterval);
       unsubscribeFirestore();
+      unsubscribeStaff();
     };
   }, []);
 
-  // ส่งสัญญาณ Heartbeat ของพนักงานที่ล็อกอินอยู่เข้าสู่ Server เพื่ออัปเดตสถานะออนไลน์เรียลไทม์
+  // ส่งสัญญาณ Heartbeat ของพนักงานหรือผู้ใช้งานที่ออนไลน์เข้าสู่ Firestore และ Server สม่ำเสมอ
   useEffect(() => {
+    let sessionDeviceId = localStorage.getItem('nunuh_session_device_id');
+    if (!sessionDeviceId) {
+      sessionDeviceId = 'device-' + Math.random().toString(36).substring(2, 9);
+      safeSetLocalStorage('nunuh_session_device_id', sessionDeviceId);
+    }
+
     const sendHeartbeat = () => {
-      if (currentStaff) {
-        const matchingStaff = activeStaffList.find(s => s.name === currentStaff.name && s.branch === currentStaff.branch);
-        const id = matchingStaff?.id || ('staff-' + currentStaff.name.replace(/\s+/g, ''));
-        fetch('/api/staff/heartbeat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            id,
-            name: currentStaff.name,
-            branch: currentStaff.branch,
-            loginTime: matchingStaff?.loginTime || Date.now()
-          })
-        }).catch(() => {});
-      }
+      const activeId = currentStaff?.id || ('staff-' + (currentStaff?.name ? currentStaff.name.replace(/\s+/g, '') : sessionDeviceId));
+      const activeName = currentStaff?.name || 'แอดมิน / เจ้าของร้าน (ออนไลน์)';
+      const activeBranch = currentStaff?.branch || 'สาขาหลัก';
+
+      // 1. ส่งเข้า Firebase Firestore เพื่อให้ทุกเครื่องทั่วโลกมองเห็นจำนวนคนออนไลน์สด
+      registerStaffOnline({
+        id: activeId,
+        name: activeName,
+        branch: activeBranch,
+        role: isStaffMode ? 'พนักงานรับออเดอร์' : isCustomerMode ? 'ลูกค้า' : 'ผู้ดูแลระบบ'
+      });
+
+      // 2. ส่งเข้า Server
+      fetch('/api/staff/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: activeId,
+          name: activeName,
+          branch: activeBranch,
+          loginTime: Date.now()
+        })
+      }).catch(() => {});
     };
 
     sendHeartbeat();
-    const interval = setInterval(sendHeartbeat, 12000);
+    const interval = setInterval(sendHeartbeat, 15000);
     return () => clearInterval(interval);
-  }, [currentStaff]);
+  }, [currentStaff, isStaffMode, isCustomerMode]);
+
+  // ซิงค์ออเดอร์ทั้งหมดขึ้น Firebase Firestore ทุกครั้งที่เปิดแอปหรือจำนวนออเดอร์เปลี่ยน
+  useEffect(() => {
+    if (orders.length > 0) {
+      syncAllLocalOrdersToFirestore(orders).catch(() => {});
+    }
+  }, [orders.length]);
 
   // บันทึกข้อมูลลง LocalStorage พร้อมผสานข้อมูลป้องกันการชนกัน (Concurrent Save Safety)
   const saveOrdersToStorage = (updatedOrders: Order[], deletedId?: string) => {
@@ -1011,9 +1112,10 @@ export default function App() {
       }
       
       setOrders(fullyMerged);
-      localStorage.setItem('nunuh_orders', JSON.stringify(fullyMerged));
+      safeSetLocalStorage('nunuh_orders', fullyMerged);
 
-      // ซิงค์ส่งขึ้น Server ทันที
+      // ซิงค์ส่งขึ้น Firestore และ Server ทันที
+      syncAllLocalOrdersToFirestore(fullyMerged).catch(() => {});
       syncWithServer(fullyMerged);
 
       // ส่งสัญญาณ BroadcastChannel ไปยังแท็บหรืออุปกรณ์อื่นทันที
@@ -1028,7 +1130,8 @@ export default function App() {
         finalOrders = finalOrders.filter(o => o.id !== deletedId);
       }
       setOrders(finalOrders);
-      localStorage.setItem('nunuh_orders', JSON.stringify(finalOrders));
+      safeSetLocalStorage('nunuh_orders', finalOrders);
+      syncAllLocalOrdersToFirestore(finalOrders).catch(() => {});
       syncWithServer(finalOrders);
     }
   };
@@ -1382,9 +1485,9 @@ export default function App() {
     <div className={`min-h-screen bg-natural-cream text-natural-espresso pb-16 font-sans transition-colors duration-300 ${theme === 'sand' ? '' : `theme-${theme}`}`}>
       
       {/* 1. BRAND HERO HEADER */}
-      <header className="bg-white/80 backdrop-blur-md border-b border-natural-wheat sticky top-0 z-50 shadow-xs no-print">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center h-20">
+      <header className="bg-white/90 backdrop-blur-md border-b border-natural-wheat sticky top-0 z-50 shadow-xs no-print">
+        <div className="w-full max-w-[1780px] mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between items-center min-h-[72px] py-2 gap-3 flex-wrap xl:flex-nowrap">
             
             {/* Elegant Logo Group */}
             <div 
@@ -1397,7 +1500,7 @@ export default function App() {
                   handleGoHome();
                 }
               }}
-              className={`flex items-center space-x-3.5 ${isStaffMode ? 'cursor-default' : 'cursor-pointer'} group transition-all relative`}
+              className={`flex items-center space-x-3 ${isStaffMode ? 'cursor-default' : 'cursor-pointer'} group transition-all relative shrink-0`}
               title={isStaffMode ? "NUNUH Staff Workspace (พนักงานรับออเดอร์)" : "คลิกเพื่อกลับสู่หน้าแรกระบบห้องเสื้อ NUNUH"}
             >
               <div className="relative group/logo">
@@ -1428,10 +1531,10 @@ export default function App() {
                 )}
               </div>
               <div>
-                <h1 className="text-2xl font-serif font-black tracking-widest text-natural-espresso group-hover:text-natural-clay transition-colors uppercase">
+                <h1 className="text-2xl font-serif font-black tracking-widest text-natural-espresso group-hover:text-natural-clay transition-colors uppercase leading-none">
                   NUNUH
                 </h1>
-                <p className="text-[9px] font-bold tracking-widest text-natural-espresso/50 uppercase">
+                <p className="text-[9px] font-bold tracking-widest text-natural-espresso/50 uppercase mt-1">
                   {isCustomerMode 
                     ? 'CUSTOMER HUB • SERVICE PORTAL' 
                     : isStaffMode 
@@ -1443,100 +1546,103 @@ export default function App() {
 
             {/* Top Workspace Tab Navs */}
             {!isCustomerMode ? (
-              <nav 
-                style={{ width: '610px', height: '79px' }}
-                className="flex items-center justify-center space-x-1 bg-natural-sand/50 p-1.5 rounded-2xl border border-natural-wheat/40"
-              >
-                  <button
-                    onClick={() => setActiveTab('tracker')}
-                    className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
-                      activeTab === 'tracker'
-                        ? 'bg-natural-clay text-white shadow-xs'
-                        : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
-                    }`}
-                  >
-                    <ClipboardCheck className="h-4 w-4" />
-                    <span className="hidden sm:inline">หน้าแรก (ติดตามงาน)</span>
-                  </button>
-
+              <nav className="flex items-center space-x-1 sm:space-x-1.5 bg-natural-sand/60 p-1.5 rounded-2xl border border-natural-wheat/60 shadow-3xs overflow-x-auto no-scrollbar max-w-full">
                 <button
-                  onClick={() => setActiveTab('orderForm')}
-                  className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
-                    activeTab === 'orderForm'
+                  type="button"
+                  onClick={() => setActiveTab('tracker')}
+                  className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                    activeTab === 'tracker'
                       ? 'bg-natural-clay text-white shadow-xs'
-                      : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
+                      : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
                   }`}
                 >
-                  <PlusCircle className="h-4 w-4" />
-                  <span className="hidden sm:inline">รับออเดอร์ใหม่</span>
+                  <ClipboardCheck className="h-4 w-4 shrink-0" />
+                  <span>หน้าแรก (ติดตามงาน)</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('orderForm')}
+                  className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+                    activeTab === 'orderForm'
+                      ? 'bg-natural-clay text-white shadow-xs'
+                      : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
+                  }`}
+                >
+                  <PlusCircle className="h-4 w-4 shrink-0" />
+                  <span>รับออเดอร์ใหม่</span>
                 </button>
 
                 {!isStaffMode && (
                   <button
+                    type="button"
                     onClick={() => setActiveTab('calendar')}
-                    className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
+                    className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                       activeTab === 'calendar'
                         ? 'bg-natural-clay text-white shadow-xs'
-                        : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
+                        : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
                     }`}
                   >
-                    <CalendarIcon className="h-4 w-4" />
-                    <span className="hidden sm:inline">ตารางกำหนดส่งชุด</span>
+                    <CalendarIcon className="h-4 w-4 shrink-0" />
+                    <span>ตารางกำหนดส่งชุด</span>
                   </button>
                 )}
 
                 <button
+                  type="button"
                   onClick={() => setActiveTab('catalogue')}
-                  className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
+                  className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                     activeTab === 'catalogue'
                       ? 'bg-natural-clay text-white shadow-xs'
-                      : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
+                      : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
                   }`}
                 >
-                  <Scissors className="h-4 w-4" />
-                  <span className="hidden sm:inline">แบบชุดเสนอแนะนำ</span>
+                  <Scissors className="h-4 w-4 shrink-0" />
+                  <span>แบบชุดเสนอแนะนำ</span>
                 </button>
 
                 {!isStaffMode && (
                   <>
                     <button
+                      type="button"
                       onClick={() => setActiveTab('customerDashboard')}
-                      className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
+                      className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                         activeTab === 'customerDashboard'
                           ? 'bg-natural-clay text-white shadow-xs'
-                          : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
+                          : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
                       }`}
                     >
-                      <Users className="h-4 w-4" />
-                      <span className="hidden sm:inline">แดชบอร์ดลูกค้า & รีวิว (IDD IDH)</span>
+                      <Users className="h-4 w-4 shrink-0" />
+                      <span>แดชบอร์ดลูกค้า & รีวิว</span>
                     </button>
 
                     <button
+                      type="button"
                       onClick={() => setActiveTab('customer')}
-                      className={`flex items-center space-x-2 px-4 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer ${
+                      className={`flex items-center space-x-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs font-bold tracking-wide transition-all cursor-pointer whitespace-nowrap shrink-0 ${
                         activeTab === 'customer'
                           ? 'bg-natural-clay text-white shadow-xs'
-                          : 'text-natural-espresso/70 hover:bg-natural-sand/80 hover:text-natural-espresso'
+                          : 'text-natural-espresso/75 hover:bg-natural-sand hover:text-natural-espresso'
                       }`}
                     >
-                      <Sparkles className="h-4 w-4 text-natural-ochre" />
+                      <Sparkles className="h-4 w-4 text-natural-ochre shrink-0" />
                       <span>สำหรับลูกค้า</span>
                     </button>
                   </>
                 )}
               </nav>
             ) : (
-              <div className="flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-extrabold bg-pink-600 text-white shadow-xs border border-pink-500/80">
+              <div className="flex items-center space-x-2 px-4 py-2.5 rounded-xl text-xs font-extrabold bg-pink-600 text-white shadow-xs border border-pink-500/80 shrink-0">
                 <Sparkles className="h-4 w-4 text-amber-300 fill-amber-300 shrink-0" />
                 <span>สำหรับลูกค้า (Customer Service & Review Portal)</span>
               </div>
             )}
 
-            {/* Elegant Theme Switcher */}
-            <div className="flex items-center space-x-3 no-print">
-              <div className="flex items-center space-x-2">
-                <span className="text-[10px] uppercase tracking-widest text-natural-espresso/40 font-bold hidden md:inline-block">
-                  ธีมร้าน:
+            {/* Elegant Theme Switcher & Actions */}
+            <div className="flex items-center space-x-2 sm:space-x-2.5 no-print shrink-0">
+              <div className="flex items-center space-x-1.5">
+                <span className="text-[10px] uppercase tracking-widest text-natural-espresso/40 font-bold hidden xl:inline-block">
+                  ธีม:
                 </span>
                 <div className="flex items-center space-x-1 bg-natural-sand/50 p-1 rounded-xl border border-natural-wheat/40">
                   <button
@@ -1607,14 +1713,14 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setShowStaffDetailModal(!showStaffDetailModal)}
-                    className="flex items-center space-x-2 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-50 hover:bg-emerald-100/90 text-emerald-950 border border-emerald-200/80 transition-all cursor-pointer shadow-3xs"
+                    className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-50 hover:bg-emerald-100/90 text-emerald-950 border border-emerald-200/80 transition-all cursor-pointer shadow-3xs whitespace-nowrap"
                     title="คลิกเพื่อดูรายชื่อพนักงานที่กำลังออนไลน์อยู่ขณะนี้"
                   >
                     <span className="relative flex h-2 w-2">
                       <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                       <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                     </span>
-                    <span className="hidden lg:inline">พนักงานออนไลน์:</span>
+                    <span className="hidden lg:inline">ออนไลน์:</span>
                     <strong className="text-emerald-700 font-extrabold">{activeStaffList.length} คน</strong>
                   </button>
 
@@ -1628,7 +1734,7 @@ export default function App() {
                         playNewOrderSound();
                       }
                     }}
-                    className={`flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold border transition-all cursor-pointer shadow-3xs hover:scale-102 ${
+                    className={`flex items-center space-x-1 px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all cursor-pointer shadow-3xs hover:scale-102 shrink-0 ${
                       soundEnabled
                         ? 'bg-amber-50 text-amber-900 border-amber-300'
                         : 'bg-gray-100 text-gray-500 border-gray-200 opacity-70'
@@ -1651,8 +1757,8 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setIsSettingsOpen(true)}
-                    className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-white hover:bg-natural-sand/30 text-natural-espresso border border-natural-wheat/80 transition-all cursor-pointer shadow-3xs hover:scale-102"
-                    title="ตั้งค่าข้อมูลห้องเสื้อ"
+                    className="flex items-center space-x-1 px-3 py-1.5 rounded-xl text-xs font-bold bg-white hover:bg-natural-sand/30 text-natural-espresso border border-natural-wheat/80 transition-all cursor-pointer shadow-3xs hover:scale-102 shrink-0"
+                    title="ตั้งค่าข้อมูลห้องเสื้อและ Firebase"
                   >
                     <Settings className="h-3.5 w-3.5 text-natural-clay" />
                     <span className="hidden md:inline">ตั้งค่าร้าน</span>
@@ -1665,8 +1771,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* 2. MAIN CORE CONTAINER */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
+      {/* 2. MAIN CORE CONTAINER - FULL DESKTOP SCREEN OPTIMIZED */}
+      <main className="w-full max-w-[1780px] mx-auto px-4 sm:px-6 lg:px-8 pt-6">
         
         {/* Staff Login Modal / Screen */}
         {isStaffMode && (!currentStaff || showAddStaffModal) && (
@@ -2156,6 +2262,39 @@ export default function App() {
                             </div>
                           </div>
                         )}
+
+                        {forceSyncResult && (
+                          <div className={`p-2.5 rounded-xl border text-[11px] flex items-start gap-2 ${
+                            forceSyncResult.success
+                              ? 'bg-emerald-50 border-emerald-300 text-emerald-950 font-medium'
+                              : 'bg-rose-50 border-rose-300 text-rose-950'
+                          }`}>
+                            <span className="text-sm mt-0.5">{forceSyncResult.success ? '🎉' : '⚠️'}</span>
+                            <div className="flex-1">
+                              <p className="font-bold">{forceSyncResult.message}</p>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Force Sync All Orders Button */}
+                        <div className="pt-1">
+                          <button
+                            type="button"
+                            disabled={isForceSyncingFirebase}
+                            onClick={handleForceSyncAllOrdersToFirebase}
+                            className="w-full px-3.5 py-2.5 bg-gradient-to-r from-emerald-600 to-teal-700 hover:from-emerald-700 hover:to-teal-800 text-white rounded-xl text-xs font-black flex items-center justify-center gap-2 transition-all cursor-pointer shadow-sm hover:shadow disabled:opacity-50"
+                          >
+                            <RefreshCw className={`h-4 w-4 text-amber-300 ${isForceSyncingFirebase ? 'animate-spin' : ''}`} />
+                            <span>
+                              {isForceSyncingFirebase
+                                ? `กำลังซิงค์ออเดอร์ทั้งหมด (${orders.length} รายการ) ขึ้นคลาวด์...`
+                                : `🚀 บังคับซิงค์ออเดอร์ทั้งหมด (${orders.length} รายการ) ขึ้น Firebase Cloud ทันที`}
+                            </span>
+                          </button>
+                          <p className="text-[10px] text-natural-espresso/50 text-center mt-1 leading-tight">
+                            * คลิกปุ่มนี้เพื่อให้ข้อมูลออเดอร์ทั้ง {orders.length} รายการบนเครื่องนี้ อัปโหลดขึ้นสู่ Firebase Firestore แบบ 100% ทำให้เครื่องอื่นเปิดแล้วเห็นครบสมบูรณ์
+                          </p>
+                        </div>
 
                         <div className="flex items-center gap-2 pt-1">
                           <button
