@@ -154,20 +154,18 @@ export default function CustomerPortal({
     }
   }, [searchedOrders]);
 
-  // Handle Avatar Portrait upload & conversion to Base64
-  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle Avatar Portrait upload & conversion to Base64 with compression
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0] && searchedOrders && searchedOrders.length > 0) {
       const file = e.target.files[0];
-      const reader = new FileReader();
-      reader.onload = (uploadEvent) => {
-        if (uploadEvent.target?.result) {
-          const base64 = uploadEvent.target.result as string;
-          const cleanPhone = searchedOrders[0].customerPhone.replace(/[\s-()]/g, '');
-          localStorage.setItem(`nunuh_customer_avatar_${cleanPhone}`, base64);
-          setProfileAvatar(base64);
-        }
-      };
-      reader.readAsDataURL(file);
+      try {
+        const compressedBase64 = await compressImage(file, 400, 400, 0.85);
+        const cleanPhone = searchedOrders[0].customerPhone.replace(/[\s-()]/g, '');
+        localStorage.setItem(`nunuh_customer_avatar_${cleanPhone}`, compressedBase64);
+        setProfileAvatar(compressedBase64);
+      } catch (err) {
+        console.error('Error compressing avatar image:', err);
+      }
     }
   };
 

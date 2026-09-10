@@ -1,0 +1,70 @@
+{
+  "entities": {
+    "Order": {
+      "title": "Order",
+      "description": "Tailor order for NUNUH Boutique",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique Order ID" },
+        "orderNumber": { "type": "string", "description": "Display Order Number" },
+        "customerName": { "type": "string", "description": "Customer Full Name" },
+        "customerPhone": { "type": "string", "description": "Customer Phone Number" },
+        "dressType": { "type": "string", "description": "Type of dress" },
+        "status": { "type": "string", "description": "Order progress status" },
+        "updatedAt": { "type": "string", "description": "Last updated timestamp" }
+      },
+      "required": ["id", "customerName", "customerPhone", "status"]
+    },
+    "CatalogueItem": {
+      "title": "CatalogueItem",
+      "description": "Standard dress pattern in catalogue",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique Catalogue Item ID" },
+        "name": { "type": "string", "description": "Dress name" },
+        "category": { "type": "string", "description": "Category" },
+        "price": { "type": "number", "description": "Estimated price" }
+      },
+      "required": ["id", "name"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Atelier settings and configuration",
+      "type": "object",
+      "properties": {
+        "boutiquePhone": { "type": "string", "description": "Contact phone" },
+        "boutiqueLogo": { "type": "string", "description": "Logo URL/Base64" },
+        "theme": { "type": "string", "description": "Theme color" }
+      }
+    },
+    "Review": {
+      "title": "Review",
+      "description": "Customer satisfaction review",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Review ID" },
+        "orderId": { "type": "string", "description": "Order ID" },
+        "rating": { "type": "number", "description": "Star rating" }
+      },
+      "required": ["id", "rating"]
+    }
+  },
+  "firestore": {
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Orders collection"
+    },
+    "/catalogue/{itemId}": {
+      "schema": "CatalogueItem",
+      "description": "Catalogue collection"
+    },
+    "/settings/{settingId}": {
+      "schema": "Setting",
+      "description": "Settings collection"
+    },
+    "/reviews/{reviewId}": {
+      "schema": "Review",
+      "description": "Customer reviews collection"
+    }
+  }
+}

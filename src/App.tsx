@@ -8,6 +8,16 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Order, OrderStatus, STATUS_MAP, CatalogueItem, CustomerReview } from './types';
 import { INITIAL_ORDERS, INITIAL_CATALOGUE, INITIAL_REVIEWS } from './initialData';
 import { playNewOrderSound } from './utils/sound';
+import {
+  saveOrderToFirestore,
+  saveOrdersBatchToFirestore,
+  deleteOrderFromFirestore,
+  fetchOrdersFromFirestore,
+  subscribeToOrders,
+  saveSettingsToFirestore,
+  saveCatalogueToFirestore,
+  testFirestoreConnection
+} from './firebase';
 
 // Components
 import DashboardStats from './components/DashboardStats';
@@ -250,6 +260,8 @@ export default function App() {
   const [isTestingPush, setIsTestingPush] = useState<boolean>(false);
   const [testPushResult, setTestPushResult] = useState<{ success: boolean; msg: string; tip?: string } | null>(null);
   const [copiedWebhook, setCopiedWebhook] = useState<boolean>(false);
+  const [isTestingFirebase, setIsTestingFirebase] = useState<boolean>(false);
+  const [firebaseTestResult, setFirebaseTestResult] = useState<{ success: boolean; latencyMs?: number; projectId?: string; message: string } | null>(null);
 
   const fetchLineConfigStatus = async () => {
     try {
@@ -420,13 +432,13 @@ export default function App() {
     const deletedSet = new Set(deletedIds);
 
     const map = new Map<string, Order>();
-    for (const o of current) {
-      if (!deletedSet.has(o.id)) {
+    for (const o of (current || [])) {
+      if (o && o.id && !deletedSet.has(o.id)) {
         map.set(o.id, o);
       }
     }
-    for (const o of incoming) {
-      if (deletedSet.has(o.id)) continue;
+    for (const o of (incoming || [])) {
+      if (!o || !o.id || deletedSet.has(o.id)) continue;
       if (!map.has(o.id)) {
         map.set(o.id, o);
       } else {
@@ -440,7 +452,9 @@ export default function App() {
     }
     // เรียงลำดับตามวันที่สร้างหรือเลขที่ออเดอร์ล่าสุดให้อยู่ด้านบน
     return Array.from(map.values()).sort((a, b) => {
-      return b.orderNumber.localeCompare(a.orderNumber, undefined, { numeric: true });
+      const numA = a.orderNumber || '';
+      const numB = b.orderNumber || '';
+      return numB.localeCompare(numA, undefined, { numeric: true });
     });
   };
 
@@ -472,12 +486,23 @@ export default function App() {
         combined = mergeOrders(combined, ordersToUpload);
       }
 
+      // Try fetching from Firebase Firestore as well
+      try {
+        const firestoreOrders = await fetchOrdersFromFirestore();
+        if (firestoreOrders && firestoreOrders.length > 0) {
+          combined = mergeOrders(combined, firestoreOrders);
+        }
+      } catch (e) {}
+
       setOrders(combined);
       localStorage.setItem('nunuh_orders', JSON.stringify(combined));
       
       const publicUrl = localStorage.getItem('nunuh_public_url') || window.location.origin;
 
       if (combined.length > 0) {
+        // Also ensure orders are saved to Firestore in background
+        saveOrdersBatchToFirestore(combined).catch(() => {});
+
         const response = await fetch('/api/orders', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -919,6 +944,23 @@ export default function App() {
       syncAllDataWithServer();
     }, 2500);
 
+    // ติดตั้ง Firebase Firestore Real-time Listener เพื่อซิงค์ข้ามทุกอุปกรณ์และหลายผู้ใช้ทันที
+    const unsubscribeFirestore = subscribeToOrders((firestoreOrders) => {
+      if (firestoreOrders && Array.isArray(firestoreOrders) && firestoreOrders.length > 0) {
+        const deletedIdsStr = localStorage.getItem('nunuh_deleted_order_ids') || '[]';
+        let deletedIds: string[] = [];
+        try { deletedIds = JSON.parse(deletedIdsStr); } catch (e) {}
+        const deletedSet = new Set(deletedIds);
+        const cleanFirestore = firestoreOrders.filter(o => !deletedSet.has(o.id));
+
+        setOrders(prev => {
+          const merged = mergeOrders(prev, cleanFirestore);
+          localStorage.setItem('nunuh_orders', JSON.stringify(merged));
+          return merged;
+        });
+      }
+    });
+
     return () => {
       window.removeEventListener('storage', handleStorageChange);
       if (channel) channel.close();
@@ -926,6 +968,7 @@ export default function App() {
       if (sseRetryTimer) clearTimeout(sseRetryTimer);
       clearInterval(pollInterval);
       clearInterval(serverPollInterval);
+      unsubscribeFirestore();
     };
   }, []);
 
@@ -1097,7 +1140,8 @@ export default function App() {
       channel.close();
     } catch (e) {}
 
-    // 4. ลบออกจากระบบเซิร์ฟเวอร์โดยตรงทันที (ซึ่งจะยิง SSE กระจายให้ผู้ใช้อื่นที่อยู่ต่างอุปกรณ์ด้วย)
+    // 4. ลบออกจากระบบเซิร์ฟเวอร์และ Firestore โดยตรงทันที (ซึ่งจะยิง SSE กระจายให้ผู้ใช้อื่นที่อยู่ต่างอุปกรณ์ด้วย)
+    deleteOrderFromFirestore(orderId).catch(() => {});
     try {
       await fetch(`/api/orders/${orderId}`, {
         method: 'DELETE'
@@ -2066,26 +2110,87 @@ export default function App() {
                   {settingsTab === 'general' && (
                     <div className="space-y-4">
                       {/* Database Persistence Status Badge */}
-                      <div className="bg-natural-sand/30 p-3 rounded-2xl border border-natural-wheat/60 space-y-1.5">
+                      <div className="bg-natural-sand/30 p-3.5 rounded-2xl border border-natural-wheat/70 space-y-2.5">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-bold text-natural-espresso flex items-center gap-1.5">
                             <Database className="h-3.5 w-3.5 text-natural-clay" />
-                            <span>สถานะฐานข้อมูลถาวร (Database Storage)</span>
+                            <span>คลาวด์ดาต้าเบส (Firebase Firestore)</span>
                           </span>
-                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 ${
-                            dbStatus?.postgresActive
-                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                              : 'bg-amber-100 text-amber-800 border border-amber-300'
-                          }`}>
-                            <span className={`w-1.5 h-1.5 rounded-full ${dbStatus?.postgresActive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
-                            {dbStatus?.postgresActive ? 'PostgreSQL เชื่อมต่อสำเร็จ 🟢' : 'Local Persistent Storage Mode 🟡'}
+                          <span className="text-[10.5px] font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1.5 bg-emerald-100 text-emerald-800 border border-emerald-300">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                            <span>Firebase Cloud (nuhpre-order) 🟢</span>
                           </span>
                         </div>
-                        <p className="text-[10.5px] text-natural-espresso/60 leading-relaxed">
-                          {dbStatus?.postgresActive
-                            ? '✅ ข้อมูลออเดอร์, การตั้งค่า และผู้ใช้งานถูกจัดเก็บบน PostgreSQL อย่างถาวร 100% (แม้ปิดเซิร์ฟเวอร์หรือ Refresh ข้อมูลจะไม่หาย)'
-                            : 'ℹ️ ระบบใช้งานโหมด Local File Storage หากเชื่อมต่อ DATABASE_URL บน Render ข้อมูลจะซิงค์เข้า PostgreSQL อัตโนมัติ'}
-                        </p>
+                        
+                        <div className="bg-white/80 p-2.5 rounded-xl border border-natural-wheat/60 text-[11px] text-natural-espresso space-y-1.5 font-medium">
+                          <div className="flex justify-between items-center text-[10.5px]">
+                            <span className="text-natural-espresso/60">Firebase Project ID:</span>
+                            <code className="font-mono font-bold bg-natural-sand/50 px-2 py-0.5 rounded text-emerald-900">nuhpre-order</code>
+                          </div>
+                          <div className="flex justify-between items-center text-[10.5px]">
+                            <span className="text-natural-espresso/60">ฐานข้อมูล Collections:</span>
+                            <span className="font-semibold text-natural-espresso">orders, catalogue, settings, system</span>
+                          </div>
+                          <div className="flex justify-between items-center text-[10.5px]">
+                            <span className="text-natural-espresso/60">สถานะการซิงค์สด (Real-time):</span>
+                            <span className="font-bold text-emerald-700 flex items-center gap-1">
+                              <Check className="h-3 w-3" /> เปิดใช้งาน (onSnapshot Listener)
+                            </span>
+                          </div>
+                        </div>
+
+                        {firebaseTestResult && (
+                          <div className={`p-2.5 rounded-xl border text-[11px] flex items-start gap-2 ${
+                            firebaseTestResult.success
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                              : 'bg-rose-50 border-rose-200 text-rose-900'
+                          }`}>
+                            <span className="text-sm mt-0.5">{firebaseTestResult.success ? '✅' : '⚠️'}</span>
+                            <div className="flex-1">
+                              <p className="font-bold">{firebaseTestResult.message}</p>
+                              {firebaseTestResult.latencyMs !== undefined && (
+                                <p className="text-[10px] opacity-80 mt-0.5">
+                                  ความเร็วในการตอบสนอง (Latency): {firebaseTestResult.latencyMs} มิลลิวินาที
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            type="button"
+                            disabled={isTestingFirebase}
+                            onClick={async () => {
+                              setIsTestingFirebase(true);
+                              try {
+                                const result = await testFirestoreConnection();
+                                setFirebaseTestResult(result);
+                              } catch (err: any) {
+                                setFirebaseTestResult({
+                                  success: false,
+                                  message: err?.message || 'เกิดข้อผิดพลาดในการทดสอบ'
+                                });
+                              } finally {
+                                setIsTestingFirebase(false);
+                              }
+                            }}
+                            className="flex-1 px-3 py-1.5 bg-natural-espresso hover:bg-natural-clay text-white rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                          >
+                            <RefreshCw className={`h-3.5 w-3.5 text-natural-ochre ${isTestingFirebase ? 'animate-spin' : ''}`} />
+                            <span>{isTestingFirebase ? 'กำลังทดสอบเชื่อมต่อ...' : 'ทดสอบการเชื่อมต่อ Firebase สด'}</span>
+                          </button>
+                          
+                          <a
+                            href="https://console.firebase.google.com/project/nuhpre-order/firestore"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-3 py-1.5 bg-natural-sand/50 hover:bg-natural-sand text-natural-espresso border border-natural-wheat rounded-xl text-xs font-bold flex items-center gap-1 transition-all"
+                          >
+                            <span>เปิด Firebase Console</span>
+                            <ExternalLink className="h-3 w-3 text-natural-espresso/60" />
+                          </a>
+                        </div>
                       </div>
 
                       <div>
