@@ -1,22 +1,19 @@
 import fs from "fs";
 import path from "path";
-import {
-  initDb,
-  isPostgresActive,
-  getOrdersFromDb,
-  saveMultipleOrdersToDb,
-  deleteOrderInDb,
-  getDeletedOrderIdsFromDb
-} from "../db";
+import { getDbModule } from "./_db_helper";
 
 const ORDERS_FILE = path.join(process.cwd(), "orders.json");
+const TMP_ORDERS_FILE = path.join("/tmp", "orders.json");
 const DELETED_ORDERS_FILE = path.join(process.cwd(), "deleted_orders.json");
+const TMP_DELETED_ORDERS_FILE = path.join("/tmp", "deleted_orders.json");
 
 function readOrdersFromFile(): any[] {
   try {
+    if (fs.existsSync(TMP_ORDERS_FILE)) {
+      return JSON.parse(fs.readFileSync(TMP_ORDERS_FILE, "utf8"));
+    }
     if (fs.existsSync(ORDERS_FILE)) {
-      const data = fs.readFileSync(ORDERS_FILE, "utf8");
-      return JSON.parse(data);
+      return JSON.parse(fs.readFileSync(ORDERS_FILE, "utf8"));
     }
   } catch (e) {
     console.error("[api/orders.ts] Error reading orders from file:", e);
@@ -24,14 +21,34 @@ function readOrdersFromFile(): any[] {
   return [];
 }
 
+function writeOrdersToFile(orders: any[]) {
+  try {
+    fs.writeFileSync(TMP_ORDERS_FILE, JSON.stringify(orders));
+  } catch (e) {}
+  try {
+    fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders));
+  } catch (e) {}
+}
+
 function readDeletedOrdersFromFile(): string[] {
   try {
+    if (fs.existsSync(TMP_DELETED_ORDERS_FILE)) {
+      return JSON.parse(fs.readFileSync(TMP_DELETED_ORDERS_FILE, "utf8"));
+    }
     if (fs.existsSync(DELETED_ORDERS_FILE)) {
-      const data = fs.readFileSync(DELETED_ORDERS_FILE, "utf8");
-      return JSON.parse(data);
+      return JSON.parse(fs.readFileSync(DELETED_ORDERS_FILE, "utf8"));
     }
   } catch (e) {}
   return [];
+}
+
+function writeDeletedOrdersToFile(deletedIds: string[]) {
+  try {
+    fs.writeFileSync(TMP_DELETED_ORDERS_FILE, JSON.stringify(deletedIds));
+  } catch (e) {}
+  try {
+    fs.writeFileSync(DELETED_ORDERS_FILE, JSON.stringify(deletedIds));
+  } catch (e) {}
 }
 
 export default async function handler(req: any, res: any) {
@@ -44,15 +61,17 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    if (isPostgresActive()) {
-      await initDb().catch(() => {});
+    const db = await getDbModule();
+
+    if (db.isPostgresActive()) {
+      await db.initDb().catch(() => {});
     }
 
     if (req.method === "GET") {
       let orders: any[] = [];
-      if (isPostgresActive()) {
+      if (db.isPostgresActive()) {
         try {
-          orders = await getOrdersFromDb();
+          orders = await db.getOrdersFromDb();
         } catch (e) {
           console.error("[Vercel orders.ts] Error reading from DB:", e);
         }
@@ -62,9 +81,9 @@ export default async function handler(req: any, res: any) {
       }
 
       let deletedIds: string[] = [];
-      if (isPostgresActive()) {
+      if (db.isPostgresActive()) {
         try {
-          deletedIds = await getDeletedOrderIdsFromDb();
+          deletedIds = await db.getDeletedOrderIdsFromDb();
         } catch (e) {}
       }
       if (!deletedIds || deletedIds.length === 0) {
@@ -81,18 +100,18 @@ export default async function handler(req: any, res: any) {
       const { orders: incomingOrders } = req.body || {};
       const ordersToSave = Array.isArray(incomingOrders) ? incomingOrders : (Array.isArray(req.body) ? req.body : []);
 
-      if (ordersToSave.length > 0 && isPostgresActive()) {
+      if (ordersToSave.length > 0 && db.isPostgresActive()) {
         try {
-          await saveMultipleOrdersToDb(ordersToSave);
+          await db.saveMultipleOrdersToDb(ordersToSave);
         } catch (e) {
           console.error("[Vercel orders.ts] Error writing to DB:", e);
         }
       }
 
       let currentDbOrders: any[] = ordersToSave;
-      if (isPostgresActive()) {
+      if (db.isPostgresActive()) {
         try {
-          const fresh = await getOrdersFromDb();
+          const fresh = await db.getOrdersFromDb();
           if (fresh && fresh.length > 0) {
             currentDbOrders = fresh;
           }
@@ -101,9 +120,36 @@ export default async function handler(req: any, res: any) {
 
       if (!currentDbOrders || currentDbOrders.length === 0) {
         currentDbOrders = readOrdersFromFile();
+      } else {
+        writeOrdersToFile(currentDbOrders);
       }
 
       return res.status(200).json(currentDbOrders);
+    }
+
+    if (req.method === "DELETE") {
+      const id = req.query?.id || req.body?.id;
+      if (!id) {
+        return res.status(400).json({ error: "Order id is required" });
+      }
+
+      if (db.isPostgresActive()) {
+        try {
+          await db.deleteOrderInDb(id);
+        } catch (e) {}
+      }
+
+      const existingDeleted = readDeletedOrdersFromFile();
+      if (!existingDeleted.includes(id)) {
+        existingDeleted.push(id);
+        writeDeletedOrdersToFile(existingDeleted);
+      }
+
+      const currentOrders = readOrdersFromFile();
+      const updated = currentOrders.filter((o: any) => o.id !== id);
+      writeOrdersToFile(updated);
+
+      return res.status(200).json({ success: true, deletedId: id });
     }
 
     return res.status(405).json({ error: "Method not allowed" });

@@ -2,12 +2,7 @@ import type { IncomingMessage, ServerResponse } from "http";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import {
-  initDb,
-  isPostgresActive,
-  getOrdersFromDb,
-  saveOrderToDb
-} from "../../db";
+import { getDbModule } from "../_db_helper";
 
 const STATUS_MAP_TH: Record<string, { label: string; desc: string }> = {
   RECEIVED: { label: "1. รับออเดอร์เรียบร้อย", desc: "บันทึกข้อมูลและสัดส่วนเข้าระบบเรียบร้อยแล้ว" },
@@ -48,12 +43,13 @@ export default async function handler(req: any, res: any) {
 
   // GET route for testing / health check
   if (req.method === "GET") {
+    const db = await getDbModule();
     return res.status(200).json({
       status: "ok",
       message: "LINE Webhook endpoint is active and ready for Messaging API events on Vercel.",
       hasToken: Boolean(process.env.LINE_CHANNEL_ACCESS_TOKEN),
       hasSecret: Boolean(process.env.LINE_CHANNEL_SECRET),
-      hasDatabase: isPostgresActive()
+      hasDatabase: db.isPostgresActive()
     });
   }
 
@@ -62,6 +58,7 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
+    const db = await getDbModule();
     const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
     const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN || "";
     const signature = (req.headers["x-line-signature"] || req.headers["X-Line-Signature"]) as string;
@@ -91,10 +88,10 @@ export default async function handler(req: any, res: any) {
 
     // Read live orders from database if available, or fallback to local orders.json
     let allOrders: any[] = [];
-    if (isPostgresActive()) {
+    if (db.isPostgresActive()) {
       try {
-        await initDb().catch(() => {});
-        allOrders = await getOrdersFromDb();
+        await db.initDb().catch(() => {});
+        allOrders = await db.getOrdersFromDb();
         console.log(`[Vercel LINE Webhook] Loaded ${allOrders.length} orders from PostgreSQL database.`);
       } catch (dbErr) {
         console.error("[Vercel LINE Webhook] Database query error:", dbErr);
@@ -223,7 +220,7 @@ export default async function handler(req: any, res: any) {
             try {
               order.lineUserId = userId;
               order.updatedAt = Date.now();
-              await saveOrderToDb(order);
+              await db.saveOrderToDb(order);
             } catch (err) {}
           }
         } else if (matchedOrders.length > 1) {

@@ -1,5 +1,10 @@
 {
   "version": 2,
+  "functions": {
+    "api/**/*.ts": {
+      "includeFiles": "{db.js,api/_db.js,api/_db.ts,orders.json,deleted_orders.json,settings.json,reviews.json,catalogue.json}"
+    }
+  },
   "rewrites": [
     {
       "source": "/api/(.*)",
